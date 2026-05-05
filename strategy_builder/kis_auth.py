@@ -35,6 +35,7 @@ def clearConsole():
 
 key_bytes = 32
 config_root = os.path.join(os.path.expanduser("~"), "KIS", "config")
+os.makedirs(config_root, exist_ok=True)
 # config_root = "$HOME/KIS/config/"  # 토큰 파일이 저장될 폴더, 제3자가 찾기 어렵도록 경로 설정하시기 바랍니다.
 # token_tmp = config_root + 'KIS000000'  # 토큰 로컬저장시 파일 이름 지정, 파일이름을 토큰값이 유추가능한 파일명은 삼가바랍니다.
 # token_tmp = config_root + 'KIS' + datetime.today().strftime("%Y%m%d%H%M%S")  # 토큰 로컬저장시 파일명 년월일시분초
@@ -44,11 +45,18 @@ token_tmp = os.path.join(
 
 # 접근토큰 관리하는 파일 존재여부 체크, 없으면 생성
 if not os.path.exists(token_tmp):
-    f = open(token_tmp, "w+")
+    with open(token_tmp, "w+", encoding="utf-8"):
+        pass
 
 # 앱키, 앱시크리트, 토큰, 계좌번호 등 저장관리, 자신만의 경로와 파일명으로 설정하시기 바랍니다.
 # pip install PyYAML (패키지설치)
-with open(os.path.join(config_root, "kis_devlp.yaml"), encoding="UTF-8") as f:
+_config_path = os.path.join(config_root, "kis_devlp.yaml")
+if not os.path.exists(_config_path):
+    _fallback_config = os.path.join(os.path.dirname(os.path.dirname(__file__)), "kis_devlp.yaml")
+    if os.path.exists(_fallback_config):
+        _config_path = _fallback_config
+
+with open(_config_path, encoding="UTF-8") as f:
     _cfg = yaml.load(f, Loader=yaml.FullLoader)
 
 _TRENV = tuple()
@@ -57,6 +65,7 @@ _autoReAuth = False
 _DEBUG = False
 _isPaper = False
 _smartSleep = 0.1
+_HTTP_TIMEOUT = (3.05, 15)
 
 # Rate Limiter: 모든 REST API 호출을 직렬화하여 초당 제한 준수
 import threading
@@ -184,7 +193,7 @@ def changeTREnv(token_key, svr="prod", product=_cfg["my_prod"]):
         my_token = _TRENV.my_token
     except AttributeError:
         my_token = ""
-    cfg["my_token"] = my_token if token_key else token_key
+    cfg["my_token"] = token_key if token_key else my_token
     cfg["my_url_ws"] = _cfg["ops" if svr == "prod" else "vops"]
 
     # print(cfg)
@@ -222,7 +231,7 @@ def auth(svr="prod", product=_cfg["my_prod"], url=None):
     if saved_token is None:  # 기존 발급 토큰 확인이 안되면 발급처리
         url = f"{_cfg[svr]}/oauth2/tokenP"
         res = requests.post(
-            url, data=json.dumps(p), headers=_getBaseHeader()
+            url, data=json.dumps(p), headers=_getBaseHeader(), timeout=_HTTP_TIMEOUT
         )  # 토큰 발급
         rescode = res.status_code
         if rescode == 200:  # 토큰 정상 발급
@@ -281,7 +290,7 @@ def getTREnv():
 def set_order_hash_key(h, p):
     url = f"{getTREnv().my_url}/uapi/hashkey"  # hashkey 발급 API URL
 
-    res = requests.post(url, data=json.dumps(p), headers=h)
+    res = requests.post(url, data=json.dumps(p), headers=h, timeout=_HTTP_TIMEOUT)
     rescode = res.status_code
     if rescode == 200:
         h["hashkey"] = _getResultObject(res.json()).HASH
@@ -459,11 +468,16 @@ def _url_fetch(
         print(f"<header>\n{headers}")
         print(f"<body>\n{params}")
 
-    if postFlag:
-        # if (hashFlag): set_order_hash_key(headers, params)
-        res = requests.post(url, headers=headers, data=json.dumps(params))
-    else:
-        res = requests.get(url, headers=headers, params=params)
+    try:
+        if postFlag:
+            # if (hashFlag): set_order_hash_key(headers, params)
+            res = requests.post(url, headers=headers, data=json.dumps(params), timeout=_HTTP_TIMEOUT)
+        else:
+            res = requests.get(url, headers=headers, params=params, timeout=_HTTP_TIMEOUT)
+    except requests.Timeout:
+        return APIRespError(408, f"Request timeout: {api_url}")
+    except requests.RequestException as e:
+        return APIRespError(599, f"Request error: {e}")
 
     if res.status_code == 200:
         ar = APIResp(res)
@@ -506,7 +520,7 @@ def auth_ws(svr="prod", product=_cfg["my_prod"]):
     p["secretkey"] = _cfg[ak2]
 
     url = f"{_cfg[svr]}/oauth2/Approval"
-    res = requests.post(url, data=json.dumps(p), headers=_getBaseHeader())  # 토큰 발급
+    res = requests.post(url, data=json.dumps(p), headers=_getBaseHeader(), timeout=_HTTP_TIMEOUT)  # 토큰 발급
     rescode = res.status_code
     if rescode == 200:  # 토큰 정상 발급
         approval_key = _getResultObject(res.json()).approval_key

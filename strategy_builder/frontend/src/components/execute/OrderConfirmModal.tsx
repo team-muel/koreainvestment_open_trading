@@ -50,7 +50,8 @@ export function OrderConfirmModal({
   // Update limit price when current price loads (if no target_price)
   useEffect(() => {
     if (!signal.target_price && currentPrice > 0) {
-      setLimitPrice(currentPrice);
+      const timer = window.setTimeout(() => setLimitPrice(currentPrice), 0);
+      return () => window.clearTimeout(timer);
     }
   }, [currentPrice, signal.target_price]);
 

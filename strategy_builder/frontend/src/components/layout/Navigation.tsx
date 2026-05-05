@@ -3,13 +3,14 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { TrendingUp, Sparkles, Play, Settings } from "lucide-react";
+import { Activity, TrendingUp, Sparkles, Play, Settings } from "lucide-react";
 import { useAuth } from "@/hooks";
 import { SettingsModal } from "@/components/settings";
 
 const navItems = [
   { href: "/builder", label: "전략 빌더", icon: Sparkles },
   { href: "/execute", label: "전략 실행", icon: Play },
+  { href: "/ict", label: "ICT Auto", icon: Activity },
 ];
 
 export function Navigation() {

@@ -2,7 +2,7 @@
  * Hook for managing localStorage strategies
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import type { StoredStrategy, BuilderState } from "@/types/builder";
 import {
   loadAllStrategies,
@@ -14,16 +14,9 @@ import {
 } from "@/lib/builder/storage";
 
 export function useLocalStrategies() {
-  const [strategies, setStrategies] = useState<StoredStrategy[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [storageAvailable, setStorageAvailable] = useState(false);
-
-  // Load strategies on mount
-  useEffect(() => {
-    setStorageAvailable(isStorageAvailable());
-    setStrategies(loadAllStrategies());
-    setIsLoading(false);
-  }, []);
+  const [strategies, setStrategies] = useState<StoredStrategy[]>(() => loadAllStrategies());
+  const [isLoading] = useState(false);
+  const [storageAvailable] = useState(() => isStorageAvailable());
 
   // Refresh strategies
   const refresh = useCallback(() => {

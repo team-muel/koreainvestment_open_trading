@@ -201,6 +201,84 @@ def get_daily_prices(
         return pd.DataFrame()
 
 
+def get_intraday_minute_prices(
+    stock_code: str,
+    target_date: str | None = None,
+    env_dv: str = "vps",
+    max_pages: int = 10,
+) -> pd.DataFrame:
+    """
+    1-minute intraday bars for local ICT cache warmup.
+
+    KIS minute history is short-range, so ICT live operation must persist rows
+    locally and resample 5m/1h/4h from that cache.
+    """
+    if not _assert_trenv_ready(f"minute 조회 {stock_code}"):
+        return pd.DataFrame()
+
+    try:
+        date_str = target_date or datetime.now().strftime("%Y%m%d")
+        current_time = "153000"
+        rows = []
+        seen = set()
+
+        for _ in range(max_pages):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": stock_code,
+                "FID_INPUT_HOUR_1": current_time,
+                "FID_INPUT_DATE_1": date_str,
+                "FID_PW_DATA_INCU_YN": "Y",
+                "FID_FAKE_TICK_INCU_YN": "",
+            }
+            res = ka._url_fetch(
+                "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+                "FHKST03010230", "", params
+            )
+            if not res.isOK():
+                logging.warning(f"분봉 조회 실패: {stock_code}")
+                break
+
+            data = res.getBody().output2
+            if not data:
+                break
+
+            page_times = []
+            for item in data:
+                time_str = item.get("stck_cntg_hour", "")
+                if not time_str:
+                    continue
+                key = f"{date_str}{time_str}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                page_times.append(time_str)
+                rows.append({
+                    "timestamp": datetime.strptime(key, "%Y%m%d%H%M%S"),
+                    "open": float(item.get("stck_oprc", 0)),
+                    "high": float(item.get("stck_hgpr", 0)),
+                    "low": float(item.get("stck_lwpr", 0)),
+                    "close": float(item.get("stck_prpr", 0)),
+                    "volume": int(item.get("cntg_vol", 0)),
+                })
+
+            if not page_times:
+                break
+            min_time = min(page_times)
+            if min_time <= "090000" or len(data) < 120:
+                break
+            current_time = min_time
+            time.sleep(0.2 if env_dv in ("vps", "demo") else 0.05)
+
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+    except Exception as e:
+        logging.error(f"분봉 조회 에러 ({stock_code}): {e}")
+        return pd.DataFrame()
+
+
 # =============================================================================
 # 현재가 조회
 # =============================================================================
@@ -261,6 +339,9 @@ def get_current_price(
             "volume": int(output.get("acml_vol", 0)),
             "w52_high": int(output.get("w52_hgpr", 0)),
             "w52_low": int(output.get("w52_lwpr", 0)),
+            "upper_limit": int(output.get("stck_mxpr", 0) or 0),
+            "lower_limit": int(output.get("stck_llam", 0) or 0),
+            "halted": str(output.get("iscd_stat_cls_code", "")) not in ("", "00", "57"),
         }
 
     except Exception as e:
@@ -333,6 +414,56 @@ def get_holdings(env_dv: str = "real") -> pd.DataFrame:
     except Exception as e:
         logging.error(f"잔고 조회 에러: {e}")
         return pd.DataFrame()
+
+
+def get_holdings_checked(env_dv: str = "real") -> tuple[pd.DataFrame, bool]:
+    """
+    Holdings lookup with an explicit success flag.
+
+    An empty holdings DataFrame can mean either "no holdings" or "API failed";
+    trading state machines must distinguish those cases before marking a
+    position as closed.
+    """
+    try:
+        raw = _get_balance_cached(env_dv)
+        if raw is None:
+            logging.warning("잔고 조회 실패")
+            return pd.DataFrame(), False
+
+        df = pd.DataFrame(raw["output1"])
+        if df.empty:
+            return pd.DataFrame(), True
+
+        df = df.rename(columns={
+            "pdno": "stock_code",
+            "prdt_name": "stock_name",
+            "hldg_qty": "quantity",
+            "pchs_avg_pric": "avg_price",
+            "prpr": "current_price",
+            "evlu_amt": "eval_amount",
+            "evlu_pfls_amt": "profit_loss",
+            "evlu_pfls_rt": "profit_rate"
+        })
+
+        columns = [
+            "stock_code", "stock_name", "quantity", "avg_price",
+            "current_price", "eval_amount", "profit_loss", "profit_rate"
+        ]
+        df = df[[col for col in columns if col in df.columns]]
+
+        for col in ["quantity", "avg_price", "current_price", "eval_amount", "profit_loss"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "profit_rate" in df.columns:
+            df["profit_rate"] = pd.to_numeric(df["profit_rate"], errors="coerce")
+        if "quantity" in df.columns:
+            df = df[df["quantity"] > 0]
+
+        return df.reset_index(drop=True), True
+
+    except Exception as e:
+        logging.error(f"잔고 조회 에러: {e}")
+        return pd.DataFrame(), False
 
 
 # =============================================================================

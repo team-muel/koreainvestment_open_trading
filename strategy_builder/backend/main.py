@@ -8,11 +8,14 @@ import sys
 # 프로젝트 루트를 path에 추가
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+repo_root = os.path.dirname(project_root)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.routers import strategy, auth, market, orders, account, files, symbols
+from backend.routers import strategy, auth, market, orders, account, files, symbols, ict
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -24,7 +27,7 @@ app = FastAPI(
 # CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,6 +41,7 @@ app.include_router(orders.router, prefix="/api/orders", tags=["주문"])
 app.include_router(account.router, prefix="/api/account", tags=["계좌"])
 app.include_router(files.router, prefix="/api/files", tags=["파일"])
 app.include_router(symbols.router, prefix="/api/symbols", tags=["종목"])
+app.include_router(ict.router, prefix="/api/ict", tags=["ICT"])
 
 
 @app.get("/api/health")
@@ -64,7 +68,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "backend.main:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8000,
         reload=True
     )

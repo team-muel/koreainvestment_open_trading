@@ -79,3 +79,13 @@ export {
   type PriceData,
   type PriceResponse,
 } from "./market";
+
+// ICT
+export {
+  getICTStatus,
+  startICTEngine,
+  stopICTEngine,
+  getICTChart,
+  getICTSetups,
+  runICTBacktest,
+} from "./ict";
