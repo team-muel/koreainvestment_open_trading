@@ -1,0 +1,15 @@
+# Install on the VPS with:
+#   crontab deploy/cron/ict-crontab
+#
+# Assumptions:
+# - Repository is checked out at /opt/kis-ict
+# - /opt/kis-ict/.env contains KIS_CONFIG_DIR and TZ
+# - Docker Compose v2 is installed
+# - Server timezone may differ; CRON_TZ pins these jobs to Korea time.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Asia/Seoul
+
+30 8 * * 1-5 cd /opt/kis-ict && /usr/bin/docker compose run --rm ict-job python scripts/ict_daily_workflow.py premarket-scan --mode vps --max-scan-symbols 100 --watchlist-limit 30 --request-delay 1.0 >> logs/cron.log 2>&1
+45 15 * * 1-5 cd /opt/kis-ict && /usr/bin/docker compose run --rm ict-job python scripts/ict_daily_workflow.py postmarket-feedback --mode vps --limit 30 --request-delay 1.0 >> logs/cron.log 2>&1

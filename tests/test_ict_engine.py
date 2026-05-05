@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(root, "strategy_builder"))
 sys.path.insert(0, root)
 
 from ict_core.models import Candle, TradeState
-from strategy_builder.backend.ict_engine import ICTTradingEngine, ManagedOrder
+from strategy_builder.backend.ict_engine import ICTConfig, ICTTradingEngine, ManagedOrder
 from strategy_builder.core.ict_cache import MinuteBarCache
 
 
@@ -22,6 +22,13 @@ def candle_at(day: int, minute: int = 0) -> Candle:
 
 
 class ICTEngineTests(unittest.TestCase):
+    def test_default_limits_are_conservative_for_first_paper_run(self):
+        config = ICTConfig()
+
+        self.assertEqual(config.max_open_positions, 1)
+        self.assertEqual(config.max_daily_entries, 1)
+        self.assertEqual(config.max_pending_per_symbol, 1)
+
     def test_ready_cache_requires_dense_intraday_days(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = MinuteBarCache(os.path.join(tmp, "bars.sqlite3"))

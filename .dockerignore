@@ -1,0 +1,34 @@
+.git
+.codex-logs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Secrets and local tokens
+.env
+.env.*
+!.env.example
+kis_devlp.yaml
+KIS/
+.kis-config/
+*.pem
+
+# Runtime data and reports
+strategy_builder/data/*.sqlite3
+strategy_builder/data/reports/
+strategy_builder/data/symbol_master/
+logs/
+
+# Frontend build artifacts
+**/node_modules/
+**/.next/
+**/next-env.d.ts
+
+# Large unrelated workspaces/artifacts
+.master/
+.lean-workspace/
+backtester/frontend/node_modules/
+backtester/frontend/.next/

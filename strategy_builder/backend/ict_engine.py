@@ -38,8 +38,8 @@ class ICTConfig:
     risk_per_trade_pct: float = 0.005
     max_position_pct: float = 0.10
     daily_loss_limit_pct: float = 0.02
-    max_daily_entries: int = 5
-    max_open_positions: int = 3
+    max_daily_entries: int = 1
+    max_open_positions: int = 1
     max_pending_per_symbol: int = 1
 
 

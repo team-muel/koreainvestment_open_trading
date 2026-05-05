@@ -7,8 +7,10 @@ from pydantic import BaseModel, Field
 
 from backend import get_current_mode, is_authenticated
 from backend.ict_engine import ict_engine
+from core.universe_scanner import KRXUniverseScanner, UniverseFilterConfig
 
 router = APIRouter()
+universe_scanner = KRXUniverseScanner(cache=ict_engine.cache)
 
 
 class StartRequest(BaseModel):
@@ -24,6 +26,23 @@ class BacktestRequest(BaseModel):
     symbols: list[str] = Field(..., min_length=1)
     start: str
     end: str
+
+
+class UniverseScanRequest(BaseModel):
+    min_price: int = 2000
+    min_avg_trading_value: int = 3_000_000_000
+    min_last_trading_value: int = 5_000_000_000
+    daily_lookback_days: int = 25
+    max_scan_symbols: int = 300
+    watchlist_limit: int = 30
+    request_delay: float = 1.0
+    require_ready_cache: bool = False
+    use_volume_rank: bool = True
+
+
+class CachedSetupScanRequest(BaseModel):
+    symbols: list[str] = Field(..., min_length=1)
+    limit: int = 30
 
 
 def _ensure_paper_authenticated() -> None:
@@ -75,3 +94,30 @@ async def get_chart(symbol: str, timeframe: str = "5m", limit: int = 160):
 @router.post("/backtest")
 async def backtest(request: BacktestRequest):
     return ict_engine.backtest_from_cache(request.symbols, request.start, request.end)
+
+
+@router.post("/universe/collect")
+async def collect_universe_master():
+    return universe_scanner.collect_master()
+
+
+@router.post("/universe/scan")
+async def scan_universe(request: UniverseScanRequest):
+    _ensure_paper_authenticated()
+    config = UniverseFilterConfig(
+        min_price=request.min_price,
+        min_avg_trading_value=request.min_avg_trading_value,
+        min_last_trading_value=request.min_last_trading_value,
+        daily_lookback_days=request.daily_lookback_days,
+        max_scan_symbols=request.max_scan_symbols,
+        watchlist_limit=request.watchlist_limit,
+        request_delay=request.request_delay,
+        require_ready_cache=request.require_ready_cache,
+        use_volume_rank=request.use_volume_rank,
+    )
+    return universe_scanner.scan(config=config, env_dv="vps")
+
+
+@router.post("/universe/cached-setups")
+async def scan_cached_setups(request: CachedSetupScanRequest):
+    return universe_scanner.scan_cached_ict_setups(request.symbols, limit=request.limit)

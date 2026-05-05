@@ -283,6 +283,59 @@ def get_intraday_minute_prices(
 # 현재가 조회
 # =============================================================================
 
+def get_volume_rank(
+    env_dv: str = "vps",
+    min_price: int = 2000,
+    max_price: int = 1_000_000,
+    min_volume: int = 100_000,
+) -> pd.DataFrame:
+    """Domestic stock volume ranking for liquidity-first universe scans."""
+    if not _assert_trenv_ready("volume rank"):
+        return pd.DataFrame()
+
+    try:
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "1",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": str(min_price),
+            "FID_INPUT_PRICE_2": str(max_price),
+            "FID_VOL_CNT": str(min_volume),
+            "FID_INPUT_DATE_1": "",
+        }
+        res = ka._url_fetch(
+            "/uapi/domestic-stock/v1/quotations/volume-rank",
+            "FHPST01710000", "", params
+        )
+        if not res.isOK():
+            logging.warning("volume rank API failed")
+            return pd.DataFrame()
+        df = pd.DataFrame(res.getBody().output)
+        if df.empty:
+            return pd.DataFrame()
+        rename_map = {
+            "mksc_shrn_iscd": "code",
+            "hts_kor_isnm": "name",
+            "stck_prpr": "price",
+            "acml_vol": "volume",
+            "acml_tr_pbmn": "trading_value",
+        }
+        df = df.rename(columns={key: value for key, value in rename_map.items() if key in df.columns})
+        for col in ["price", "volume", "trading_value"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        if "code" not in df.columns:
+            return pd.DataFrame()
+        return df
+    except Exception as e:
+        logging.error(f"volume rank error: {e}")
+        return pd.DataFrame()
+
+
 def get_current_price(
     stock_code: str,
     env_dv: str = "real"

@@ -4,12 +4,13 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
   },
-  // P1: Frontend 3000, Backend 8000
+  // Frontend 3000 -> Backend 8000. Docker uses backend service DNS.
   async rewrites() {
+    const backendUrl = process.env.BACKEND_INTERNAL_URL || 'http://localhost:8000';
     return [
       {
         source: '/api/:path*',
-        destination: 'http://localhost:8000/api/:path*',
+        destination: `${backendUrl}/api/:path*`,
       },
     ];
   },
