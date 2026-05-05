@@ -175,4 +175,4 @@ backtester/examples/output/*.py
 # ===== Claude settings =====
 settings.local.json
 
-.serena/
+.serena/secrets/

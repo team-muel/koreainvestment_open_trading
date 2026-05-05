@@ -13,8 +13,10 @@ import argparse
 import json
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
+
+KST = timezone(timedelta(hours=9))
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,7 @@ sys.path.insert(0, str(ROOT / "strategy_builder"))
 import kis_auth as ka  # noqa: E402
 from strategy_builder.core import data_fetcher  # noqa: E402
 from strategy_builder.core.ict_cache import MinuteBarCache  # noqa: E402
+from strategy_builder.core.gcal_reporter import publish_gcal_event_if_configured  # noqa: E402
 from strategy_builder.core.notion_reporter import publish_daily_report_if_configured  # noqa: E402
 from strategy_builder.core.universe_scanner import KRXUniverseScanner, UniverseFilterConfig  # noqa: E402
 
@@ -112,12 +115,27 @@ def run_premarket_scan(args: argparse.Namespace) -> int:
         _write_json(json_path, result)
         _write_json(LATEST_WATCHLIST, result)
 
+    notion_url = (notion_page or {}).get("url")
+    watchlist_count = len(result.get("watchlist", []))
+    gcal_event = _publish_gcal(
+        workflow="premarket-scan",
+        report_date=stamp,
+        notion_url=notion_url,
+        summary_text=f"오늘 워치리스트: {watchlist_count}종목",
+        event_dt=datetime.now(KST).replace(hour=8, minute=30, second=0, microsecond=0),
+    )
+    if gcal_event:
+        result["gcal"] = gcal_event
+        _write_json(json_path, result)
+        _write_json(LATEST_WATCHLIST, result)
+
     print(json.dumps({
         "status": "success",
         "json": str(json_path),
         "markdown": str(md_path),
         "notion": notion_page,
-        "watchlist_count": len(result.get("watchlist", [])),
+        "gcal": gcal_event,
+        "watchlist_count": watchlist_count,
         "symbols_for_ict_start": result.get("symbols_for_ict_start", []),
     }, ensure_ascii=False, indent=2))
     return 0
@@ -192,13 +210,27 @@ def run_postmarket_feedback(args: argparse.Namespace) -> int:
         result["notion"] = notion_page
         _write_json(json_path, result)
 
+    notion_url = (notion_page or {}).get("url")
+    actionable = cached_setups.get("actionable_count", 0)
+    gcal_event = _publish_gcal(
+        workflow="postmarket-feedback",
+        report_date=stamp,
+        notion_url=notion_url,
+        summary_text=f"워치리스트 {len(watchlist)}종목 / 액션어블 {actionable}종목",
+        event_dt=datetime.now(KST).replace(hour=15, minute=45, second=0, microsecond=0),
+    )
+    if gcal_event:
+        result["gcal"] = gcal_event
+        _write_json(json_path, result)
+
     print(json.dumps({
         "status": "success",
         "json": str(json_path),
         "markdown": str(md_path),
         "notion": notion_page,
+        "gcal": gcal_event,
         "watchlist_count": len(watchlist),
-        "actionable_count": cached_setups.get("actionable_count", 0),
+        "actionable_count": actionable,
     }, ensure_ascii=False, indent=2))
     return 0
 
@@ -268,6 +300,26 @@ def _publish_notion(
             markdown_path=str(markdown_path),
             json_path=str(json_path),
             summary=summary,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _publish_gcal(
+    *,
+    workflow: str,
+    report_date: str,
+    notion_url: str | None,
+    summary_text: str,
+    event_dt: datetime,
+) -> dict | None:
+    try:
+        return publish_gcal_event_if_configured(
+            workflow=workflow,
+            report_date=report_date,
+            notion_url=notion_url,
+            summary_text=summary_text,
+            event_dt=event_dt,
         )
     except Exception as exc:
         return {"error": str(exc)}

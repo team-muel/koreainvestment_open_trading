@@ -49,8 +49,13 @@ services:
       PYTHONPATH: /app:/app/strategy_builder
       NOTION_TOKEN: ${NOTION_TOKEN:-}
       NOTION_DAILY_REPORTS_DB_ID: ${NOTION_DAILY_REPORTS_DB_ID:-}
+      GOOGLE_OAUTH_CLIENT_JSON: ${GOOGLE_OAUTH_CLIENT_JSON:-}
+      GOOGLE_TOKEN_JSON: ${GOOGLE_TOKEN_JSON:-}
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID:-}
     volumes:
       - ${KIS_CONFIG_DIR:?Set KIS_CONFIG_DIR in .env}:/root/KIS/config:rw
       - ./strategy_builder/data:/app/strategy_builder/data:rw
       - ./logs:/app/logs:rw
+      - ${GOOGLE_OAUTH_CLIENT_JSON:-/dev/null}:${GOOGLE_OAUTH_CLIENT_JSON:-/dev/null}:ro
+      - ${GOOGLE_TOKEN_JSON:-/dev/null}:${GOOGLE_TOKEN_JSON:-/dev/null}:rw
     command: ["python", "scripts/ict_daily_workflow.py", "--help"]
