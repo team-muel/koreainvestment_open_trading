@@ -34,6 +34,7 @@ class UniverseFilterConfig:
     min_last_trading_value: int = 5_000_000_000
     min_prev_change_pct: float = 0.01
     max_prev_change_pct: float = 0.08
+    min_relative_volume: float = 2.0
     daily_lookback_days: int = 25
     max_scan_symbols: int = 200
     watchlist_limit: int = 30
@@ -50,6 +51,14 @@ class UniverseCandidate:
     last_trading_value: float
     avg_trading_value: float
     prev_change_pct: float
+    prev_high_distance_pct: float | None
+    prev_low_distance_pct: float | None
+    relative_volume: float
+    liquidity_level: str
+    ict_setup: str
+    scan_reason: str
+    priority: int
+    invalidation_level: float | None
     ready_coverage_days: int
     setup: dict | None = None
 
@@ -64,6 +73,16 @@ class UniverseCandidate:
             "last_trading_value": self.last_trading_value,
             "avg_trading_value": self.avg_trading_value,
             "prev_change_pct": self.prev_change_pct,
+            "prev_high_distance_pct": self.prev_high_distance_pct,
+            "prev_low_distance_pct": self.prev_low_distance_pct,
+            "relative_volume": self.relative_volume,
+            "liquidity_level": self.liquidity_level,
+            "ict_setup": self.ict_setup,
+            "scan_reason": self.scan_reason,
+            "priority": self.priority,
+            "invalidation_level": self.invalidation_level,
+            "plan": "09:15-10:30 OR Low/previous low sweep + VWAP reclaim only",
+            "status": "WATCHLIST",
             "ready_coverage_days": self.ready_coverage_days,
             "setup": self.setup,
         }
@@ -110,7 +129,11 @@ class KRXUniverseScanner:
             time.sleep(config.request_delay)
 
         ranked = sorted(candidates, key=lambda item: item.avg_trading_value, reverse=True)
-        watchlist = [candidate.to_dict() for candidate in ranked[: config.watchlist_limit]]
+        watchlist = []
+        for rank, candidate in enumerate(ranked[: config.watchlist_limit], start=1):
+            item = candidate.to_dict()
+            item["volume_rank"] = rank
+            watchlist.append(item)
         return {
             "master": collected,
             "filters": {
@@ -119,6 +142,7 @@ class KRXUniverseScanner:
                 "min_last_trading_value": config.min_last_trading_value,
                 "min_prev_change_pct": config.min_prev_change_pct,
                 "max_prev_change_pct": config.max_prev_change_pct,
+                "min_relative_volume": config.min_relative_volume,
                 "max_scan_symbols": config.max_scan_symbols,
                 "watchlist_limit": config.watchlist_limit,
                 "require_ready_cache": config.require_ready_cache,
@@ -175,8 +199,16 @@ class KRXUniverseScanner:
         last_volume = int(last["volume"])
         last_trading_value = last_close * last_volume
         avg_trading_value = float((df["close"] * df["volume"]).tail(20).mean())
+        avg_volume = float(df["volume"].tail(20).mean())
+        relative_volume = last_volume / avg_volume if avg_volume > 0 else 0.0
         prev_close = float(df.iloc[-2]["close"]) if len(df) >= 2 else 0.0
         prev_change_pct = ((last_close - prev_close) / prev_close) if prev_close > 0 else 0.0
+        prev_high = float(df.iloc[-2]["high"]) if len(df) >= 2 else None
+        prev_low = float(df.iloc[-2]["low"]) if len(df) >= 2 else None
+        recent_high = float(df["high"].tail(5).max()) if "high" in df else None
+        recent_low = float(df["low"].tail(5).min()) if "low" in df else None
+        prev_high_distance_pct = ((prev_high - last_close) / last_close) if prev_high and last_close > 0 else None
+        prev_low_distance_pct = ((last_close - prev_low) / last_close) if prev_low and last_close > 0 else None
         ready_days = self.cache.ready_coverage_days(symbol.code)
 
         if last_close < config.min_price:
@@ -189,10 +221,21 @@ class KRXUniverseScanner:
             return None
         if prev_change_pct > config.max_prev_change_pct:
             return None
+        if relative_volume < config.min_relative_volume:
+            return None
         if config.require_ready_cache and ready_days < 20:
             return None
 
         setup = self._build_setup_from_cache(symbol.code)
+        liquidity_level = self._liquidity_level(prev_high_distance_pct, prev_low_distance_pct)
+        ict_setup = self._ict_setup_text(prev_high_distance_pct, prev_low_distance_pct, recent_high, recent_low, last_close)
+        priority = self._priority(relative_volume, prev_high_distance_pct, prev_low_distance_pct)
+        invalidation_level = prev_low if prev_low is not None else recent_low
+        scan_reason = (
+            f"prev change {prev_change_pct:.2%}, relative volume {relative_volume:.2f}x, "
+            f"prev high distance {self._fmt_pct(prev_high_distance_pct)}, "
+            f"prev low distance {self._fmt_pct(prev_low_distance_pct)}"
+        )
         return UniverseCandidate(
             symbol=symbol,
             last_close=last_close,
@@ -200,6 +243,14 @@ class KRXUniverseScanner:
             last_trading_value=last_trading_value,
             avg_trading_value=avg_trading_value,
             prev_change_pct=prev_change_pct,
+            prev_high_distance_pct=prev_high_distance_pct,
+            prev_low_distance_pct=prev_low_distance_pct,
+            relative_volume=relative_volume,
+            liquidity_level=liquidity_level,
+            ict_setup=ict_setup,
+            scan_reason=scan_reason,
+            priority=priority,
+            invalidation_level=invalidation_level,
             ready_coverage_days=ready_days,
             setup=None if setup is None else setup.to_dict(),
         )
@@ -236,3 +287,50 @@ class KRXUniverseScanner:
             return None
         bars_1d = self.cache.resample(bars_1m, 390, "1d")
         return self.builder.build_long_setup(symbol, bars_1m, bars_1d)
+
+    @staticmethod
+    def _liquidity_level(prev_high_distance_pct: float | None, prev_low_distance_pct: float | None) -> str:
+        distances = [abs(value) for value in (prev_high_distance_pct, prev_low_distance_pct) if value is not None]
+        if not distances:
+            return "unknown"
+        nearest = min(distances)
+        if nearest < 0.005:
+            return "at_liquidity"
+        if nearest <= 0.03:
+            return "near_previous_liquidity"
+        return "far_from_previous_liquidity"
+
+    @staticmethod
+    def _ict_setup_text(
+        prev_high_distance_pct: float | None,
+        prev_low_distance_pct: float | None,
+        recent_high: float | None,
+        recent_low: float | None,
+        last_close: float,
+    ) -> str:
+        near_prev_low = prev_low_distance_pct is not None and 0 <= prev_low_distance_pct <= 0.03
+        near_recent_low = recent_low is not None and last_close > 0 and 0 <= (last_close - recent_low) / last_close <= 0.03
+        near_prev_high = prev_high_distance_pct is not None and 0 <= prev_high_distance_pct <= 0.03
+        near_recent_high = recent_high is not None and last_close > 0 and 0 <= (recent_high - last_close) / last_close <= 0.03
+        if near_prev_low or near_recent_low:
+            return "Long reclaim candidate near sell-side liquidity"
+        if near_prev_high or near_recent_high:
+            return "Buy-side liquidity nearby; avoid chase and wait for reclaim"
+        return "Liquidity context weak; monitor only"
+
+    @staticmethod
+    def _priority(relative_volume: float, prev_high_distance_pct: float | None, prev_low_distance_pct: float | None) -> int:
+        score = 1
+        if relative_volume >= 3:
+            score += 2
+        elif relative_volume >= 2:
+            score += 1
+        for value in (prev_high_distance_pct, prev_low_distance_pct):
+            if value is not None and 0.005 <= abs(value) <= 0.03:
+                score += 2
+                break
+        return min(score, 5)
+
+    @staticmethod
+    def _fmt_pct(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.2%}"

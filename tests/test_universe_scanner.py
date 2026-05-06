@@ -63,6 +63,7 @@ class UniverseScannerTests(unittest.TestCase):
                     min_avg_trading_value=3_000_000_000,
                     min_last_trading_value=5_000_000_000,
                     min_prev_change_pct=0,
+                    min_relative_volume=0,
                     max_scan_symbols=10,
                     watchlist_limit=10,
                     request_delay=0,
@@ -105,6 +106,7 @@ class UniverseScannerTests(unittest.TestCase):
                     watchlist_limit=2,
                     request_delay=0,
                     min_prev_change_pct=0,
+                    min_relative_volume=0,
                 ))
 
         self.assertEqual(called, ["000660", "005930"])

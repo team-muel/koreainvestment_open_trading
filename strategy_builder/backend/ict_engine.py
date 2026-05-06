@@ -10,6 +10,7 @@ The engine is intentionally conservative:
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from ict_core.builder import krx_tick_size
 
 from core import data_fetcher
 from core.ict_cache import MinuteBarCache
+from core.ict_journal import ICTJournal
+from core.gcal_reporter import publish_gcal_signal_if_configured
 from core.ict_realtime import RealtimeTickCollector
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
@@ -35,7 +38,7 @@ class ICTConfig:
     config_id: str = "default_ict_v1"
     min_cache_days: int = 20
     loop_interval_seconds: int = 15
-    risk_per_trade_pct: float = 0.005
+    risk_per_trade_pct: float = 0.003
     max_position_pct: float = 0.10
     daily_loss_limit_pct: float = 0.005
     max_daily_entries: int = 2
@@ -114,6 +117,8 @@ class ICTTradingEngine:
         self._daily_realized = 0.0
         self._last_total_eval = 0
         self._last_error: str | None = None
+        self._last_signal_fingerprint: dict[str, str] = {}
+        self.journal = ICTJournal()
 
     def start(self, symbols: list[str]) -> dict[str, Any]:
         clean_symbols = [s for s in dict.fromkeys(symbols) if len(s) == 6 and s.isdigit()]
@@ -166,6 +171,7 @@ class ICTTradingEngine:
                 "positions": positions,
                 "realtime": self.realtime.status(),
                 "daily_risk": {
+                    "state": self._daily_state(),
                     "entries": daily_entries,
                     "max_entries": self.config.max_daily_entries,
                     "loss": daily_loss,
@@ -284,6 +290,7 @@ class ICTTradingEngine:
         with self._lock:
             self._setups[symbol] = setup.to_dict()
 
+        self._record_signal_if_changed(setup.to_dict(), action_taken=False)
         if setup.trade_plan is None:
             return
         if self.cache.ready_coverage_days(symbol) < self.config.min_cache_days:
@@ -307,6 +314,7 @@ class ICTTradingEngine:
         quantity = self._calculate_quantity(setup.trade_plan)
         if quantity <= 0:
             return
+        self._record_signal_if_changed(setup.to_dict(), action_taken=True)
         self._submit_entry(setup.trade_plan, quantity)
 
     def _build_setup_from_1m(self, symbol: str, bars_1m: list[Candle]):
@@ -344,6 +352,8 @@ class ICTTradingEngine:
         with self._lock:
             self._pending[plan.symbol] = order
             self._daily_entries += 1
+        self.journal.record_trade_event("ENTRY_SUBMITTED", order.to_dict(), {"entry_reason": plan.reason})
+        self._publish_signal_calendar_event(plan, quantity)
 
     def _manage_position(self, symbol: str) -> None:
         with self._lock:
@@ -397,8 +407,16 @@ class ICTTradingEngine:
             return
         if holdings_ok and holding_qty <= 0:
             position.status = TradeState.CLOSED
+            estimated_exit = position.take_profit if position.take_profit > 0 else position.entry
+            estimated_pnl = (estimated_exit - position.entry) * position.quantity
             with self._lock:
+                self._daily_realized += estimated_pnl
                 self._positions.pop(symbol, None)
+            self.journal.record_trade_event(
+                "POSITION_CLOSED",
+                position.to_dict(),
+                {"exit_reason": "holding quantity is zero; estimated close from broker holdings check"},
+            )
             return
         if position.status == TradeState.EXITING:
             return
@@ -475,6 +493,7 @@ class ICTTradingEngine:
                 order.exit_order_no = str(row.get("ODNO", ""))
                 order.exit_org_no = str(row.get("KRX_FWDG_ORD_ORGNO", ""))
                 self._daily_loss += max(0.0, (order.entry - order.stop) * order.quantity)
+            self.journal.record_trade_event("EXIT_SUBMITTED", order.to_dict(), {"exit_reason": reason})
         else:
             self._mark_degraded("synthetic stop market exit failed")
 
@@ -625,6 +644,15 @@ class ICTTradingEngine:
             return False
         return self._daily_realized >= total_eval * self.config.daily_profit_target_pct
 
+    def _daily_state(self) -> str:
+        if self._daily_profit_target_reached():
+            return "STOPPED_BY_TARGET"
+        if self._daily_loss_limit_reached(fetch_account=False):
+            return "STOPPED_BY_LOSS"
+        if self._daily_entries >= self.config.max_daily_entries:
+            return "ENTRY_LIMIT_REACHED"
+        return "ACTIVE"
+
     def _force_exit_due(self, order: ManagedOrder) -> bool:
         if not self.config.force_exit_time:
             return False
@@ -673,6 +701,43 @@ class ICTTradingEngine:
         with self._lock:
             self._degraded = True
             self._last_error = message
+
+    def _record_signal_if_changed(self, setup: dict[str, Any], action_taken: bool) -> None:
+        symbol = str(setup.get("symbol") or "")
+        if not symbol:
+            return
+        fingerprint_payload = {
+            "state": setup.get("state"),
+            "trade_plan": setup.get("trade_plan"),
+            "notes": setup.get("notes", [])[-3:],
+            "trigger": (setup.get("details") or {}).get("trigger", {}),
+        }
+        fingerprint = json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False, default=str)
+        with self._lock:
+            if self._last_signal_fingerprint.get(symbol) == fingerprint and not action_taken:
+                return
+            self._last_signal_fingerprint[symbol] = fingerprint
+        reason_not_taken = "" if action_taken else "; ".join(setup.get("notes", [])[-3:])
+        self.journal.record_signal(setup, action_taken=action_taken, reason_not_taken=reason_not_taken)
+
+    @staticmethod
+    def _publish_signal_calendar_event(plan: TradePlan, quantity: int) -> None:
+        try:
+            publish_gcal_signal_if_configured(
+                ticker=plan.symbol,
+                title="Buy submitted",
+                description=(
+                    f"Setup: {plan.reason}\n"
+                    f"Entry: {plan.entry:,.0f}\n"
+                    f"Stop: {plan.stop:,.0f}\n"
+                    f"Target: {plan.take_profit:,.0f}\n"
+                    f"Quantity: {quantity}\n"
+                    "Action: monitor fill, TP, VWAP reclaim failure, and force-exit rules."
+                ),
+                event_dt=datetime.now(),
+            )
+        except Exception:
+            logger.exception("failed to publish ICT signal calendar event")
 
     @staticmethod
     def _df_to_candles(symbol: str, df: pd.DataFrame) -> list[Candle]:

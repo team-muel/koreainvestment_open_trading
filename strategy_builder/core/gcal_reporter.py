@@ -167,6 +167,45 @@ class GCalReporter:
         data = resp.json()
         return {"id": data.get("id"), "url": data.get("htmlLink")}
 
+    def create_signal_event(
+        self,
+        *,
+        ticker: str,
+        title: str,
+        description: str,
+        event_dt: datetime,
+        reminder_minutes: int = 0,
+    ) -> dict[str, Any]:
+        end_dt = event_dt + timedelta(minutes=10)
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        body = {
+            "summary": f"[ICT SIGNAL] {ticker} {title}",
+            "description": description,
+            "start": {"dateTime": event_dt.strftime(fmt), "timeZone": "Asia/Seoul"},
+            "end": {"dateTime": end_dt.strftime(fmt), "timeZone": "Asia/Seoul"},
+            "extendedProperties": {
+                "private": {
+                    "ict_workflow": "signal",
+                    "ticker": ticker,
+                }
+            },
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "popup", "minutes": reminder_minutes},
+                ],
+            },
+        }
+        resp = requests.post(
+            f"{self.BASE}/calendars/{self.config.calendar_id}/events",
+            headers=self._headers(),
+            json=body,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {"id": data.get("id"), "url": data.get("htmlLink")}
+
     def _build_body(
         self,
         *,
@@ -248,5 +287,25 @@ def publish_gcal_event_if_configured(
         summary_text=summary_text,
         event_dt=event_dt,
         duration_minutes=duration_minutes,
+        reminder_minutes=reminder_minutes,
+    )
+
+
+def publish_gcal_signal_if_configured(
+    *,
+    ticker: str,
+    title: str,
+    description: str,
+    event_dt: datetime,
+    reminder_minutes: int = 0,
+) -> dict[str, Any] | None:
+    config = GCalConfig.from_env()
+    if config is None:
+        return None
+    return GCalReporter(config).create_signal_event(
+        ticker=ticker,
+        title=title,
+        description=description,
+        event_dt=event_dt,
         reminder_minutes=reminder_minutes,
     )

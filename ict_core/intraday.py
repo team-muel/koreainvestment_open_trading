@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time
+from typing import Any
 
 from .builder import krx_tick_size
 from .models import Candle, ICTSetup, TradePlan, TradeState
@@ -14,17 +15,20 @@ class IntradayReclaimConfig:
     market_open: time = time(9, 0)
     opening_range_end: time = time(9, 15)
     earliest_entry: time = time(9, 15)
-    latest_entry: time = time(14, 30)
+    latest_entry: time = time(10, 30)
     force_exit: time = time(14, 50)
     min_price: float = 2000
     max_stop_pct: float = 0.01
     fixed_stop_pct: float = 0.005
-    reclaim_bars: int = 3
+    reclaim_bars: int = 5
+    min_sweep_pct: float = 0.001
     vwap_reclaim_window: int = 5
-    min_volume_ratio: float = 1.0
+    vwap_confirm_closes: int = 2
+    min_volume_ratio: float = 1.5
     min_entry_buffer_ticks: int = 1
     partial_r: float = 1.0
     final_r: float = 2.0
+    min_rr: float = 1.5
 
 
 class IntradayLiquidityReclaimBuilder:
@@ -51,29 +55,49 @@ class IntradayLiquidityReclaimBuilder:
         candles_1d: list[Candle] | None = None,
     ) -> ICTSetup:
         notes: list[str] = ["strategy=KIS ICT Intraday Liquidity Reclaim"]
+        details: dict[str, Any] = {
+            "setup": {"watchlist_required": True},
+            "trigger": {},
+            "execution": {},
+            "exit": {
+                "partial_r": self.config.partial_r,
+                "final_r": self.config.final_r,
+                "force_exit_time": self.config.force_exit.strftime("%H:%M"),
+            },
+        }
         bars = sorted(candles_1m, key=lambda candle: candle.timestamp)
         if len(bars) < 20:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WARMING_UP, notes=notes + ["not enough 1m bars"])
+            return self._setup(symbol, "neutral", TradeState.WARMING_UP, notes + ["not enough 1m bars"], details)
 
         current_day = bars[-1].timestamp.date()
         day_bars = [bar for bar in bars if bar.timestamp.date() == current_day and self.config.market_open <= bar.timestamp.time() <= time(15, 30)]
         if len(day_bars) < 16:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WAITING_TRIGGER, last_price=bars[-1].close, notes=notes + ["waiting for opening range"])
+            return self._setup(symbol, "neutral", TradeState.WAITING_TRIGGER, notes + ["waiting for opening range"], details, last_price=bars[-1].close)
 
         last = day_bars[-1]
+        details["setup"]["current_time"] = last.timestamp.strftime("%H:%M")
         if last.close < self.config.min_price:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WAITING_TRIGGER, last_price=last.close, notes=notes + ["price below minimum filter"])
+            return self._setup(symbol, "neutral", TradeState.WAITING_TRIGGER, notes + ["price below minimum filter"], details, last_price=last.close)
         if last.timestamp.time() < self.config.earliest_entry:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WAITING_TRIGGER, last_price=last.close, notes=notes + ["observe only before 09:15"])
+            return self._setup(symbol, "neutral", TradeState.WAITING_TRIGGER, notes + ["observe only before 09:15"], details, last_price=last.close)
         if last.timestamp.time() > self.config.latest_entry:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.CANCELLED, last_price=last.close, notes=notes + ["entry window closed"])
+            return self._setup(symbol, "neutral", TradeState.CANCELLED, notes + ["entry window closed"], details, last_price=last.close)
 
         opening = [bar for bar in day_bars if self.config.market_open <= bar.timestamp.time() < self.config.opening_range_end]
         if not opening:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WAITING_TRIGGER, last_price=last.close, notes=notes + ["opening range missing"])
+            return self._setup(symbol, "neutral", TradeState.WAITING_TRIGGER, notes + ["opening range missing"], details, last_price=last.close)
         or_high = max(bar.high for bar in opening)
         or_low = min(bar.low for bar in opening)
         prev_low = self._previous_day_low(candles_1d or [], current_day)
+        prev_high = self._previous_day_high(candles_1d or [], current_day)
+        details["setup"].update({
+            "opening_range_high": or_high,
+            "opening_range_low": or_low,
+            "previous_day_high": prev_high,
+            "previous_day_low": prev_low,
+            "distance_to_prev_high_pct": None if prev_high is None else (prev_high - last.close) / last.close,
+            "distance_to_prev_low_pct": None if prev_low is None else (last.close - prev_low) / last.close,
+        })
         sweep_levels = [or_low]
         if prev_low is not None:
             sweep_levels.append(prev_low)
@@ -91,9 +115,32 @@ class IntradayLiquidityReclaimBuilder:
                 poi_low=or_low,
                 poi_high=or_high,
                 notes=notes + ["waiting for OR low or previous low sweep"],
+                details=details,
             )
 
         reclaim_index = self._find_reclaim(day_bars, sweep_index, sweep_level)
+        sweep_low = min(bar.low for bar in day_bars[sweep_index: min(len(day_bars), sweep_index + self.config.reclaim_bars + 1)])
+        sweep_depth_pct = (sweep_level - sweep_low) / sweep_level if sweep_level > 0 else 0.0
+        details["trigger"].update({
+            "liquidity_level": sweep_level,
+            "sweep_index": sweep_index,
+            "sweep_time": day_bars[sweep_index].timestamp.isoformat(),
+            "sweep_low": sweep_low,
+            "sweep_depth_pct": sweep_depth_pct,
+            "sweep_confirmed": sweep_depth_pct >= self.config.min_sweep_pct,
+        })
+        if sweep_depth_pct < self.config.min_sweep_pct:
+            return self._setup(
+                symbol,
+                "neutral",
+                TradeState.WAITING_TRIGGER,
+                notes + [f"sweep depth below threshold: {sweep_depth_pct:.2%}"],
+                details,
+                last_price=last.close,
+                poi_low=or_low,
+                poi_high=or_high,
+                sweep_index=sweep_index,
+            )
         if reclaim_index is None:
             return ICTSetup(
                 symbol=symbol,
@@ -104,10 +151,18 @@ class IntradayLiquidityReclaimBuilder:
                 poi_high=or_high,
                 sweep_index=sweep_index,
                 notes=notes + ["sweep found; waiting for quick reclaim"],
+                details=details,
             )
+        details["trigger"].update({
+            "reclaim_index": reclaim_index,
+            "reclaim_minutes": reclaim_index - sweep_index,
+            "reclaim_confirmed": True,
+        })
 
         vwap_values = self._intraday_vwap(day_bars)
         vwap_reclaim_index = self._find_vwap_reclaim(day_bars, vwap_values, reclaim_index)
+        latest_vwap = vwap_values[-1]
+        details["trigger"]["vwap"] = latest_vwap
         if vwap_reclaim_index is None:
             return ICTSetup(
                 symbol=symbol,
@@ -118,6 +173,28 @@ class IntradayLiquidityReclaimBuilder:
                 poi_high=or_high,
                 sweep_index=sweep_index,
                 notes=notes + ["waiting for VWAP reclaim"],
+                details=details,
+            )
+        details["trigger"].update({
+            "vwap_reclaim_index": vwap_reclaim_index,
+            "vwap_reclaim_time": day_bars[vwap_reclaim_index].timestamp.isoformat(),
+            "vwap_reclaim_confirmed": True,
+        })
+
+        consecutive_above = self._consecutive_closes_above_vwap(day_bars, vwap_values)
+        details["trigger"]["vwap_consecutive_closes"] = consecutive_above
+        if consecutive_above < self.config.vwap_confirm_closes:
+            return self._setup(
+                symbol,
+                "neutral",
+                TradeState.WAITING_TRIGGER,
+                notes + [f"waiting for {self.config.vwap_confirm_closes} consecutive closes above VWAP"],
+                details,
+                last_price=last.close,
+                poi_low=or_low,
+                poi_high=or_high,
+                sweep_index=sweep_index,
+                choch_index=vwap_reclaim_index,
             )
 
         if not self._latest_5m_closes_above_vwap(day_bars, vwap_values):
@@ -130,7 +207,9 @@ class IntradayLiquidityReclaimBuilder:
                 poi_high=or_high,
                 sweep_index=sweep_index,
                 notes=notes + ["waiting for 5m close above VWAP"],
+                details=details,
             )
+        details["trigger"]["five_min_vwap_close_confirmed"] = True
 
         if not self._breaks_previous_1m_high(day_bars):
             return ICTSetup(
@@ -142,9 +221,13 @@ class IntradayLiquidityReclaimBuilder:
                 poi_high=or_high,
                 sweep_index=sweep_index,
                 notes=notes + ["waiting for previous 1m high break"],
+                details=details,
             )
+        details["trigger"]["mss_confirmed"] = True
 
-        if not self._volume_confirms(day_bars):
+        volume_ratio = self._volume_ratio(day_bars)
+        details["trigger"]["volume_ratio"] = volume_ratio
+        if volume_ratio < self.config.min_volume_ratio:
             return ICTSetup(
                 symbol=symbol,
                 trend="neutral",
@@ -154,21 +237,31 @@ class IntradayLiquidityReclaimBuilder:
                 poi_high=or_high,
                 sweep_index=sweep_index,
                 notes=notes + ["waiting for volume confirmation"],
+                details=details,
             )
 
         entry = last.close
         tick = krx_tick_size(entry)
         if entry <= 0:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WAITING_TRIGGER, notes=notes + ["invalid entry"])
+            return self._setup(symbol, "neutral", TradeState.WAITING_TRIGGER, notes + ["invalid entry"], details)
 
-        sweep_low = min(bar.low for bar in day_bars[sweep_index:reclaim_index + 1])
         vwap_stop = vwap_values[-1] - tick
         structural_stop = sweep_low - (tick * 2)
         fixed_stop = entry * (1 - self.config.fixed_stop_pct)
         stop = min(structural_stop, vwap_stop, fixed_stop)
         risk = entry - stop
+        details["execution"].update({
+            "entry_candidate": entry,
+            "stop_candidate": stop,
+            "structural_stop": structural_stop,
+            "vwap_stop": vwap_stop,
+            "fixed_stop": fixed_stop,
+            "risk_per_share": risk,
+            "risk_pct": risk / entry if entry > 0 else None,
+            "minimum_rr": self.config.min_rr,
+        })
         if risk <= 0:
-            return ICTSetup(symbol=symbol, trend="neutral", state=TradeState.WAITING_TRIGGER, last_price=last.close, notes=notes + ["invalid stop"])
+            return self._setup(symbol, "neutral", TradeState.WAITING_TRIGGER, notes + ["invalid stop"], details, last_price=last.close)
         if risk / entry > self.config.max_stop_pct:
             return ICTSetup(
                 symbol=symbol,
@@ -179,10 +272,30 @@ class IntradayLiquidityReclaimBuilder:
                 poi_high=or_high,
                 sweep_index=sweep_index,
                 notes=notes + [f"stop width too large: {risk / entry:.2%}"],
+                details=details,
             )
 
         partial_tp = entry + risk * self.config.partial_r
         final_tp = entry + risk * self.config.final_r
+        rr = (final_tp - entry) / risk if risk > 0 else 0.0
+        details["execution"].update({
+            "partial_take_profit": partial_tp,
+            "final_take_profit": final_tp,
+            "risk_reward": rr,
+        })
+        if rr < self.config.min_rr:
+            return self._setup(
+                symbol,
+                "neutral",
+                TradeState.WAITING_TRIGGER,
+                notes + [f"risk reward below threshold: {rr:.2f}"],
+                details,
+                last_price=last.close,
+                poi_low=or_low,
+                poi_high=or_high,
+                sweep_index=sweep_index,
+                choch_index=vwap_reclaim_index,
+            )
         plan = TradePlan(
             symbol=symbol,
             side="buy",
@@ -192,7 +305,7 @@ class IntradayLiquidityReclaimBuilder:
             partial_take_profit=partial_tp,
             final_take_profit=final_tp,
             force_exit_time=self.config.force_exit.strftime("%H:%M"),
-            risk_reward=self.config.final_r,
+            risk_reward=rr,
             reason="Intraday OR/previous-low sweep, VWAP reclaim, 5m VWAP close, 1m high break",
         )
         return ICTSetup(
@@ -212,8 +325,10 @@ class IntradayLiquidityReclaimBuilder:
                 f"OR High={or_high:.2f}",
                 f"OR Low={or_low:.2f}",
                 f"VWAP={vwap_values[-1]:.2f}",
+                f"Scan Reason: OR/previous low sweep depth {sweep_depth_pct:.2%}, VWAP reclaim, MSS, volume {volume_ratio:.2f}x",
                 "long setup confirmed",
             ],
+            details=details,
         )
 
     def _previous_day_low(self, candles_1d: list[Candle], current_day) -> float | None:
@@ -221,6 +336,12 @@ class IntradayLiquidityReclaimBuilder:
         if not previous:
             return None
         return previous[-1].low
+
+    def _previous_day_high(self, candles_1d: list[Candle], current_day) -> float | None:
+        previous = [bar for bar in candles_1d if bar.timestamp.date() < current_day]
+        if not previous:
+            return None
+        return previous[-1].high
 
     def _find_long_sweep(self, bars: list[Candle], levels: list[float]) -> tuple[int, float] | None:
         start = next((i for i, bar in enumerate(bars) if bar.timestamp.time() >= self.config.opening_range_end), 0)
@@ -258,12 +379,26 @@ class IntradayLiquidityReclaimBuilder:
         return bars[-1].close > bars[-2].high
 
     def _volume_confirms(self, bars: list[Candle], lookback: int = 5) -> bool:
+        return self._volume_ratio(bars, lookback=lookback) >= self.config.min_volume_ratio
+
+    @staticmethod
+    def _volume_ratio(bars: list[Candle], lookback: int = 5) -> float:
         if len(bars) <= lookback:
-            return False
+            return 0.0
         sample = [bar.volume for bar in bars[-lookback - 1:-1] if bar.volume > 0]
         if not sample:
-            return True
-        return bars[-1].volume >= (sum(sample) / len(sample)) * self.config.min_volume_ratio
+            return 999.0
+        average = sum(sample) / len(sample)
+        return bars[-1].volume / average if average > 0 else 0.0
+
+    @staticmethod
+    def _consecutive_closes_above_vwap(bars: list[Candle], vwap: list[float]) -> int:
+        count = 0
+        for bar, value in zip(reversed(bars), reversed(vwap)):
+            if bar.close <= value:
+                break
+            count += 1
+        return count
 
     @staticmethod
     def _intraday_vwap(bars: list[Candle]) -> list[float]:
@@ -277,3 +412,31 @@ class IntradayLiquidityReclaimBuilder:
             cumulative_volume += volume
             values.append(cumulative_pv / cumulative_volume if cumulative_volume > 0 else typical)
         return values
+
+    @staticmethod
+    def _setup(
+        symbol: str,
+        trend: str,
+        state: TradeState,
+        notes: list[str],
+        details: dict[str, Any],
+        *,
+        last_price: float | None = None,
+        poi_low: float | None = None,
+        poi_high: float | None = None,
+        sweep_index: int | None = None,
+        choch_index: int | None = None,
+    ) -> ICTSetup:
+        return ICTSetup(
+            symbol=symbol,
+            trend=trend,  # type: ignore[arg-type]
+            state=state,
+            last_price=last_price,
+            poi_type="none",
+            poi_low=poi_low,
+            poi_high=poi_high,
+            sweep_index=sweep_index,
+            choch_index=choch_index,
+            notes=notes,
+            details=details,
+        )

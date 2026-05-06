@@ -27,13 +27,13 @@ class IntradayReclaimTests(unittest.TestCase):
     def test_long_setup_requires_opening_range_sweep_vwap_reclaim_and_high_break(self):
         bars = []
         for minute in range(15):
-            bars.append(bar(minute, 10030, 10050, 10010, 10030, 1000))
+            bars.append(bar(minute, 10030, 10050, 10020, 10030, 1000))
         bars.extend([
-            bar(15, 10020, 10030, 10005, 10020, 1100),
+            bar(15, 10020, 10030, 10009, 10025, 1100),
             bar(16, 10020, 10040, 10015, 10035, 1200),
             bar(17, 10035, 10055, 10025, 10045, 1300),
             bar(18, 10045, 10070, 10040, 10060, 1500),
-            bar(19, 10060, 10090, 10055, 10080, 2500),
+            bar(19, 10060, 10090, 10055, 10080, 3000),
         ])
 
         setup = IntradayLiquidityReclaimBuilder().build_long_setup("005930", bars, [])
@@ -41,8 +41,28 @@ class IntradayReclaimTests(unittest.TestCase):
         self.assertIsNotNone(setup.trade_plan)
         self.assertEqual(setup.trend, "bullish")
         self.assertIn("long setup confirmed", setup.notes)
+        self.assertTrue(setup.details["trigger"]["sweep_confirmed"])
+        self.assertTrue(setup.details["trigger"]["mss_confirmed"])
+        self.assertGreaterEqual(setup.details["trigger"]["volume_ratio"], 1.5)
         self.assertAlmostEqual(setup.trade_plan.partial_take_profit, setup.trade_plan.entry + (setup.trade_plan.entry - setup.trade_plan.stop))
         self.assertAlmostEqual(setup.trade_plan.final_take_profit, setup.trade_plan.entry + (setup.trade_plan.entry - setup.trade_plan.stop) * 2)
+
+    def test_rejects_shallow_sweep_even_when_price_recovers(self):
+        bars = []
+        for minute in range(15):
+            bars.append(bar(minute, 10030, 10050, 10010, 10030, 1000))
+        bars.extend([
+            bar(15, 10020, 10030, 10005, 10020, 1100),
+            bar(16, 10020, 10040, 10015, 10035, 1200),
+            bar(17, 10035, 10055, 10025, 10045, 1300),
+            bar(18, 10045, 10070, 10040, 10060, 1500),
+            bar(19, 10060, 10090, 10055, 10070, 3000),
+        ])
+
+        setup = IntradayLiquidityReclaimBuilder().build_long_setup("005930", bars, [])
+
+        self.assertIsNone(setup.trade_plan)
+        self.assertTrue(any("sweep depth below threshold" in note for note in setup.notes))
 
     def test_rejects_setup_when_stop_width_is_too_large(self):
         bars = []

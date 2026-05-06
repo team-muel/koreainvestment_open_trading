@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-last-trading-value", type=int, default=5_000_000_000)
     parser.add_argument("--min-prev-change-pct", type=float, default=0.01)
     parser.add_argument("--max-prev-change-pct", type=float, default=0.08)
+    parser.add_argument("--min-relative-volume", type=float, default=2.0)
     parser.add_argument("--daily-lookback-days", type=int, default=25)
     parser.add_argument("--max-scan-symbols", type=int, default=200)
     parser.add_argument("--watchlist-limit", type=int, default=30)
@@ -46,6 +47,7 @@ def main() -> int:
         min_last_trading_value=args.min_last_trading_value,
         min_prev_change_pct=args.min_prev_change_pct,
         max_prev_change_pct=args.max_prev_change_pct,
+        min_relative_volume=args.min_relative_volume,
         daily_lookback_days=args.daily_lookback_days,
         max_scan_symbols=args.max_scan_symbols,
         watchlist_limit=args.watchlist_limit,

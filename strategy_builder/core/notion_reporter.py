@@ -49,6 +49,7 @@ class NotionReporter:
         json_path: str,
         summary: dict[str, Any],
     ) -> dict[str, Any]:
+        self._ensure_daily_schema()
         existing = self._find_daily_report(report_date)
         properties = self._daily_properties(
             report_date=report_date,
@@ -75,6 +76,33 @@ class NotionReporter:
             })
         return {"id": page.get("id"), "url": page.get("url")}
 
+    def _ensure_daily_schema(self) -> None:
+        properties = {
+            "Start Equity": {"number": {"format": "number"}},
+            "End Equity": {"number": {"format": "number"}},
+            "Daily PnL": {"number": {"format": "number"}},
+            "Daily Return %": {"number": {"format": "percent"}},
+            "Max Intraday Drawdown %": {"number": {"format": "percent"}},
+            "Trades Count": {"number": {"format": "number"}},
+            "Win Rate": {"number": {"format": "percent"}},
+            "Average R": {"number": {"format": "number"}},
+            "Profit Factor": {"number": {"format": "number"}},
+            "Rule Violation?": {"rich_text": {}},
+            "Goal Hit?": {"rich_text": {}},
+            "Stopped Reason": {"rich_text": {}},
+            "Market Condition": {"rich_text": {}},
+            "What Worked": {"rich_text": {}},
+            "What Failed": {"rich_text": {}},
+            "Next Rule Change": {"rich_text": {}},
+        }
+        try:
+            self._patch(
+                f"https://api.notion.com/v1/databases/{self.config.daily_reports_db_id}",
+                {"properties": properties},
+            )
+        except requests.HTTPError:
+            return
+
     def _find_daily_report(self, report_date: str) -> dict[str, Any] | None:
         response = self._post(
             f"https://api.notion.com/v1/databases/{self.config.daily_reports_db_id}/query",
@@ -100,7 +128,7 @@ class NotionReporter:
         json_path: str,
         summary: dict[str, Any],
     ) -> dict[str, Any]:
-        return {
+        properties = {
             "Name": {"title": [{"text": {"content": title}}]},
             "Date": {"date": {"start": report_date}},
             "Workflow": {"select": {"name": workflow}},
@@ -111,6 +139,35 @@ class NotionReporter:
             "Markdown Path": {"rich_text": [{"text": {"content": markdown_path}}]},
             "JSON Path": {"rich_text": [{"text": {"content": json_path}}]},
         }
+        number_fields = {
+            "Start Equity": "start_equity",
+            "End Equity": "end_equity",
+            "Daily PnL": "daily_pnl",
+            "Daily Return %": "daily_return_pct",
+            "Max Intraday Drawdown %": "max_intraday_drawdown_pct",
+            "Trades Count": "trades_count",
+            "Win Rate": "win_rate",
+            "Average R": "average_r",
+            "Profit Factor": "profit_factor",
+        }
+        text_fields = {
+            "Rule Violation?": "rule_violation",
+            "Goal Hit?": "goal_hit",
+            "Stopped Reason": "stopped_reason",
+            "Market Condition": "market_condition",
+            "What Worked": "what_worked",
+            "What Failed": "what_failed",
+            "Next Rule Change": "next_rule_change",
+        }
+        for notion_name, summary_key in number_fields.items():
+            if summary_key in summary and summary.get(summary_key) is not None:
+                properties[notion_name] = {"number": float(summary.get(summary_key) or 0)}
+        for notion_name, summary_key in text_fields.items():
+            if summary_key in summary and summary.get(summary_key) is not None:
+                properties[notion_name] = {
+                    "rich_text": [{"text": {"content": str(summary.get(summary_key, ""))[:2000]}}],
+                }
+        return properties
 
     def _markdown_blocks(self, markdown_path: str) -> list[dict[str, Any]]:
         path = Path(markdown_path)

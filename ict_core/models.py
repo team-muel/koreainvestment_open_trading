@@ -150,6 +150,7 @@ class ICTSetup:
     trap_30m: bool = False
     liquidity_score: int = 0
     notes: list[str] = field(default_factory=list)
+    details: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -186,4 +187,5 @@ class ICTSetup:
             "trap_30m": self.trap_30m,
             "liquidity_score": self.liquidity_score,
             "notes": list(self.notes),
+            "details": dict(self.details),
         }

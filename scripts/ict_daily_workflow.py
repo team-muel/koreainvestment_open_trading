@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "strategy_builder"))
 import kis_auth as ka  # noqa: E402
 from strategy_builder.core import data_fetcher  # noqa: E402
 from strategy_builder.core.ict_cache import MinuteBarCache  # noqa: E402
+from strategy_builder.core.ict_journal import ICTJournal  # noqa: E402
 from strategy_builder.core.gcal_reporter import publish_gcal_event_if_configured  # noqa: E402
 from strategy_builder.core.notion_reporter import publish_daily_report_if_configured  # noqa: E402
 from strategy_builder.core.universe_scanner import KRXUniverseScanner, UniverseFilterConfig  # noqa: E402
@@ -46,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     scan.add_argument("--min-last-trading-value", type=int, default=5_000_000_000)
     scan.add_argument("--min-prev-change-pct", type=float, default=0.01)
     scan.add_argument("--max-prev-change-pct", type=float, default=0.08)
+    scan.add_argument("--min-relative-volume", type=float, default=2.0)
     scan.add_argument("--daily-lookback-days", type=int, default=25)
     scan.add_argument("--max-scan-symbols", type=int, default=200)
     scan.add_argument("--watchlist-limit", type=int, default=30)
@@ -84,6 +86,7 @@ def run_premarket_scan(args: argparse.Namespace) -> int:
         min_last_trading_value=args.min_last_trading_value,
         min_prev_change_pct=args.min_prev_change_pct,
         max_prev_change_pct=args.max_prev_change_pct,
+        min_relative_volume=args.min_relative_volume,
         daily_lookback_days=args.daily_lookback_days,
         max_scan_symbols=args.max_scan_symbols,
         watchlist_limit=args.watchlist_limit,
@@ -101,6 +104,9 @@ def run_premarket_scan(args: argparse.Namespace) -> int:
     _write_json(json_path, result)
     _write_json(LATEST_WATCHLIST, result)
     _write_text(md_path, _premarket_markdown(result))
+    journal = ICTJournal()
+    for item in result.get("watchlist", []):
+        journal.record_premarket_candidate(item, stamp)
     notion_page = _publish_notion(
         report_date=stamp,
         workflow="premarket-scan",
@@ -197,6 +203,21 @@ def run_postmarket_feedback(args: argparse.Namespace) -> int:
     md_path = REPORT_ROOT / f"{stamp}_postmarket_feedback.md"
     _write_json(json_path, result)
     _write_text(md_path, _postmarket_markdown(result))
+    ICTJournal().record_daily_report({
+        "date": stamp,
+        "workflow": "postmarket-feedback",
+        "summary": {
+            "trades_count": 0,
+            "goal_hit": "unknown",
+            "stopped_reason": "postmarket review only",
+            "market_condition": "review required",
+            "what_worked": "",
+            "what_failed": "",
+            "next_rule_change": "",
+        },
+        "rows": rows,
+        "cached_setups": cached_setups,
+    })
     notion_page = _publish_notion(
         report_date=stamp,
         workflow="postmarket-feedback",
@@ -249,14 +270,15 @@ def _premarket_markdown(result: dict) -> str:
         f"- Candidates: {result.get('candidate_count', 0)}",
         f"- Watchlist: {len(result.get('watchlist', []))}",
         "",
-        "| Rank | Code | Name | Exchange | Last Close | Avg Trading Value | Ready Days |",
-        "|---:|---|---|---|---:|---:|---:|",
+        "| Rank | Code | Name | Exchange | Last Close | Prev % | Rel Vol | Liquidity | Priority | Reason |",
+        "|---:|---|---|---|---:|---:|---:|---|---:|---|",
     ]
     for idx, item in enumerate(result.get("watchlist", []), start=1):
         lines.append(
             f"| {idx} | {item.get('code')} | {item.get('name')} | {item.get('exchange')} | "
-            f"{item.get('last_close', 0):,.0f} | {item.get('avg_trading_value', 0):,.0f} | "
-            f"{item.get('ready_coverage_days', 0)} |"
+            f"{item.get('last_close', 0):,.0f} | {float(item.get('prev_change_pct', 0) or 0):.2%} | "
+            f"{float(item.get('relative_volume', 0) or 0):.2f}x | {item.get('liquidity_level', '')} | "
+            f"{item.get('priority', '')} | {item.get('scan_reason', '')} |"
         )
     return "\n".join(lines) + "\n"
 
