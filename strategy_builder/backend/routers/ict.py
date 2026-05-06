@@ -32,8 +32,10 @@ class UniverseScanRequest(BaseModel):
     min_price: int = 2000
     min_avg_trading_value: int = 3_000_000_000
     min_last_trading_value: int = 5_000_000_000
+    min_prev_change_pct: float = 0.01
+    max_prev_change_pct: float = 0.08
     daily_lookback_days: int = 25
-    max_scan_symbols: int = 300
+    max_scan_symbols: int = 200
     watchlist_limit: int = 30
     request_delay: float = 1.0
     require_ready_cache: bool = False
@@ -108,6 +110,8 @@ async def scan_universe(request: UniverseScanRequest):
         min_price=request.min_price,
         min_avg_trading_value=request.min_avg_trading_value,
         min_last_trading_value=request.min_last_trading_value,
+        min_prev_change_pct=request.min_prev_change_pct,
+        max_prev_change_pct=request.max_prev_change_pct,
         daily_lookback_days=request.daily_lookback_days,
         max_scan_symbols=request.max_scan_symbols,
         watchlist_limit=request.watchlist_limit,

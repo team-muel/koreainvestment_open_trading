@@ -5,8 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from ict_core import ICTSetup
-from ict_core.builder import ICTSetupBuilder
+from ict_core import ICTSetup, IntradayLiquidityReclaimBuilder
 
 from . import data_fetcher
 from .ict_cache import MinuteBarCache
@@ -33,8 +32,10 @@ class UniverseFilterConfig:
     min_price: int = 2000
     min_avg_trading_value: int = 3_000_000_000
     min_last_trading_value: int = 5_000_000_000
+    min_prev_change_pct: float = 0.01
+    max_prev_change_pct: float = 0.08
     daily_lookback_days: int = 25
-    max_scan_symbols: int = 300
+    max_scan_symbols: int = 200
     watchlist_limit: int = 30
     request_delay: float = 1.0
     require_ready_cache: bool = False
@@ -48,6 +49,7 @@ class UniverseCandidate:
     last_volume: int
     last_trading_value: float
     avg_trading_value: float
+    prev_change_pct: float
     ready_coverage_days: int
     setup: dict | None = None
 
@@ -61,6 +63,7 @@ class UniverseCandidate:
             "last_volume": self.last_volume,
             "last_trading_value": self.last_trading_value,
             "avg_trading_value": self.avg_trading_value,
+            "prev_change_pct": self.prev_change_pct,
             "ready_coverage_days": self.ready_coverage_days,
             "setup": self.setup,
         }
@@ -71,11 +74,11 @@ class KRXUniverseScanner:
         self,
         master: SymbolMaster | None = None,
         cache: MinuteBarCache | None = None,
-        builder: ICTSetupBuilder | None = None,
+        builder: IntradayLiquidityReclaimBuilder | None = None,
     ):
         self.master = master or SymbolMaster()
         self.cache = cache or MinuteBarCache()
-        self.builder = builder or ICTSetupBuilder()
+        self.builder = builder or IntradayLiquidityReclaimBuilder()
 
     def collect_master(self) -> dict:
         return self.master.collect(["kospi", "kosdaq"])
@@ -114,6 +117,8 @@ class KRXUniverseScanner:
                 "min_price": config.min_price,
                 "min_avg_trading_value": config.min_avg_trading_value,
                 "min_last_trading_value": config.min_last_trading_value,
+                "min_prev_change_pct": config.min_prev_change_pct,
+                "max_prev_change_pct": config.max_prev_change_pct,
                 "max_scan_symbols": config.max_scan_symbols,
                 "watchlist_limit": config.watchlist_limit,
                 "require_ready_cache": config.require_ready_cache,
@@ -170,6 +175,8 @@ class KRXUniverseScanner:
         last_volume = int(last["volume"])
         last_trading_value = last_close * last_volume
         avg_trading_value = float((df["close"] * df["volume"]).tail(20).mean())
+        prev_close = float(df.iloc[-2]["close"]) if len(df) >= 2 else 0.0
+        prev_change_pct = ((last_close - prev_close) / prev_close) if prev_close > 0 else 0.0
         ready_days = self.cache.ready_coverage_days(symbol.code)
 
         if last_close < config.min_price:
@@ -177,6 +184,10 @@ class KRXUniverseScanner:
         if last_trading_value < config.min_last_trading_value:
             return None
         if avg_trading_value < config.min_avg_trading_value:
+            return None
+        if prev_change_pct < config.min_prev_change_pct:
+            return None
+        if prev_change_pct > config.max_prev_change_pct:
             return None
         if config.require_ready_cache and ready_days < 20:
             return None
@@ -188,6 +199,7 @@ class KRXUniverseScanner:
             last_volume=last_volume,
             last_trading_value=last_trading_value,
             avg_trading_value=avg_trading_value,
+            prev_change_pct=prev_change_pct,
             ready_coverage_days=ready_days,
             setup=None if setup is None else setup.to_dict(),
         )
@@ -222,9 +234,5 @@ class KRXUniverseScanner:
         bars_1m = self.cache.get_1m_bars(symbol)
         if len(bars_1m) < 300:
             return None
-        bars_5m = self.cache.resample(bars_1m, 5, "5m")
-        bars_30m = self.cache.resample(bars_1m, 30, "30m")
-        bars_1h = self.cache.resample(bars_1m, 60, "1h")
-        bars_4h = self.cache.resample(bars_1m, 240, "4h")
         bars_1d = self.cache.resample(bars_1m, 390, "1d")
-        return self.builder.build_long_setup(symbol, bars_5m, bars_1h, bars_4h, bars_30m, bars_1d)
+        return self.builder.build_long_setup(symbol, bars_1m, bars_1d)

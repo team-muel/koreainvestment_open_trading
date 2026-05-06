@@ -11,5 +11,5 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CRON_TZ=Asia/Seoul
 
-30 8 * * 1-5 cd /opt/kis-ict && /usr/bin/docker compose run --rm ict-job python scripts/ict_daily_workflow.py premarket-scan --mode vps --max-scan-symbols 100 --watchlist-limit 30 --request-delay 1.0 >> logs/cron.log 2>&1
+30 8 * * 1-5 cd /opt/kis-ict && /usr/bin/docker compose run --rm ict-job python scripts/ict_daily_workflow.py premarket-scan --mode vps --max-scan-symbols 200 --watchlist-limit 30 --request-delay 1.0 >> logs/cron.log 2>&1
 45 15 * * 1-5 cd /opt/kis-ict && /usr/bin/docker compose run --rm ict-job python scripts/ict_daily_workflow.py postmarket-feedback --mode vps --limit 30 --request-delay 1.0 >> logs/cron.log 2>&1

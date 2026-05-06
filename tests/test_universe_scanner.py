@@ -62,6 +62,7 @@ class UniverseScannerTests(unittest.TestCase):
                     min_price=2000,
                     min_avg_trading_value=3_000_000_000,
                     min_last_trading_value=5_000_000_000,
+                    min_prev_change_pct=0,
                     max_scan_symbols=10,
                     watchlist_limit=10,
                     request_delay=0,
@@ -99,7 +100,12 @@ class UniverseScannerTests(unittest.TestCase):
                 patch("strategy_builder.core.universe_scanner.data_fetcher.get_daily_prices", side_effect=daily_prices),
                 patch("strategy_builder.core.universe_scanner.data_fetcher.get_volume_rank", return_value=rank),
             ):
-                scanner.scan(UniverseFilterConfig(max_scan_symbols=2, watchlist_limit=2, request_delay=0))
+                scanner.scan(UniverseFilterConfig(
+                    max_scan_symbols=2,
+                    watchlist_limit=2,
+                    request_delay=0,
+                    min_prev_change_pct=0,
+                ))
 
         self.assertEqual(called, ["000660", "005930"])
 

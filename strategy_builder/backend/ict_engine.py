@@ -18,7 +18,7 @@ from typing import Any
 
 import pandas as pd
 
-from ict_core import Candle, ICTReplayBacktester, ICTSetupBuilder, TradePlan, TradeState
+from ict_core import Candle, ICTReplayBacktester, IntradayLiquidityReclaimBuilder, TradePlan, TradeState
 from ict_core.builder import krx_tick_size
 
 from core import data_fetcher
@@ -37,10 +37,12 @@ class ICTConfig:
     loop_interval_seconds: int = 15
     risk_per_trade_pct: float = 0.005
     max_position_pct: float = 0.10
-    daily_loss_limit_pct: float = 0.02
-    max_daily_entries: int = 1
+    daily_loss_limit_pct: float = 0.005
+    max_daily_entries: int = 2
     max_open_positions: int = 1
     max_pending_per_symbol: int = 1
+    daily_profit_target_pct: float = 0.005
+    force_exit_time: str = "14:50"
 
 
 @dataclass
@@ -58,6 +60,10 @@ class ManagedOrder:
     take_profit: float = 0.0
     tp_order_no: str = ""
     tp_org_no: str = ""
+    tp2_order_no: str = ""
+    tp2_org_no: str = ""
+    partial_take_profit: float = 0.0
+    final_take_profit: float = 0.0
     exit_order_no: str = ""
     exit_org_no: str = ""
     missing_pending_checks: int = 0
@@ -78,6 +84,10 @@ class ManagedOrder:
             "take_profit": self.take_profit,
             "tp_order_no": self.tp_order_no,
             "tp_org_no": self.tp_org_no,
+            "tp2_order_no": self.tp2_order_no,
+            "tp2_org_no": self.tp2_org_no,
+            "partial_take_profit": self.partial_take_profit,
+            "final_take_profit": self.final_take_profit,
             "exit_order_no": self.exit_order_no,
             "exit_org_no": self.exit_org_no,
             "submitted_at": self.submitted_at,
@@ -89,7 +99,7 @@ class ICTTradingEngine:
         self.cache = cache or MinuteBarCache()
         self.realtime = RealtimeTickCollector(self.cache, env_dv="vps")
         self.config = config or ICTConfig()
-        self.builder = ICTSetupBuilder()
+        self.builder = IntradayLiquidityReclaimBuilder()
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -101,6 +111,7 @@ class ICTTradingEngine:
         self._warmup_dates: dict[str, str] = {}
         self._daily_entries = 0
         self._daily_loss = 0.0
+        self._daily_realized = 0.0
         self._last_total_eval = 0
         self._last_error: str | None = None
 
@@ -158,6 +169,9 @@ class ICTTradingEngine:
                     "entries": daily_entries,
                     "max_entries": self.config.max_daily_entries,
                     "loss": daily_loss,
+                    "realized": self._daily_realized,
+                    "profit_target_pct": self.config.daily_profit_target_pct,
+                    "profit_target_reached": self._daily_profit_target_reached(),
                     "loss_limit_pct": self.config.daily_loss_limit_pct,
                     "loss_limit_reached": loss_limit_reached,
                 },
@@ -281,6 +295,8 @@ class ICTTradingEngine:
                 return
             if self._daily_entries >= self.config.max_daily_entries:
                 return
+            if self._daily_profit_target_reached():
+                return
             if self._daily_loss_limit_reached(fetch_account=True):
                 return
 
@@ -294,12 +310,8 @@ class ICTTradingEngine:
         self._submit_entry(setup.trade_plan, quantity)
 
     def _build_setup_from_1m(self, symbol: str, bars_1m: list[Candle]):
-        bars_5m = MinuteBarCache.resample(bars_1m, 5, "5m")
-        bars_30m = MinuteBarCache.resample(bars_1m, 30, "30m")
-        bars_1h = MinuteBarCache.resample(bars_1m, 60, "1h")
-        bars_4h = MinuteBarCache.resample(bars_1m, 240, "4h")
-        bars_1d = MinuteBarCache.resample(bars_1m, 1440, "1d")
-        return self.builder.build_long_setup(symbol, bars_5m, bars_1h, bars_4h, bars_30m, bars_1d)
+        bars_1d = MinuteBarCache.resample(bars_1m, 390, "1d")
+        return self.builder.build_long_setup(symbol, bars_1m, bars_1d)
 
     def _submit_entry(self, plan: TradePlan, quantity: int) -> None:
         signal = Signal(
@@ -326,6 +338,8 @@ class ICTTradingEngine:
             entry=plan.entry,
             stop=plan.stop,
             take_profit=plan.take_profit,
+            partial_take_profit=plan.partial_take_profit or 0.0,
+            final_take_profit=plan.final_take_profit or plan.take_profit,
         )
         with self._lock:
             self._pending[plan.symbol] = order
@@ -391,36 +405,31 @@ class ICTTradingEngine:
 
         price_data = data_fetcher.get_current_price(symbol, "vps")
         current_price = float(price_data.get("price", 0) or 0)
+        if self._force_exit_due(position):
+            position.status = TradeState.EXITING
+            if not self._cancel_take_profit_orders(position):
+                return
+            self._submit_market_exit(position, reason="ICT intraday force exit")
+            return
         if current_price > 0 and current_price <= position.stop:
             position.status = TradeState.EXITING
-            if position.tp_order_no:
-                if not self._cancel_order(
-                    position,
-                    "vps",
-                    order_no=position.tp_order_no,
-                    org_no=position.tp_org_no,
-                    remove_pending=False,
-                ):
-                    self._mark_degraded("take-profit cancel failed before synthetic stop")
-                    return
-                pending_orders, pending_ok = data_fetcher.get_pending_orders("vps")
-                if not pending_ok:
-                    self._mark_degraded("take-profit cancel status could not be verified before synthetic stop")
-                    return
-                if self._order_still_pending(position.tp_order_no, pending_orders):
-                    self._mark_degraded("take-profit remains pending after cancel response")
-                    return
+            if not self._cancel_take_profit_orders(position):
+                return
             self._submit_market_exit(position)
 
     def _submit_take_profit(self, order: ManagedOrder) -> None:
+        tp1 = order.partial_take_profit or order.take_profit
+        tp2 = order.final_take_profit or order.take_profit
+        qty1 = max(1, order.quantity // 2)
+        qty2 = max(0, order.quantity - qty1)
         signal = Signal(
             stock_code=order.symbol,
             stock_name=order.symbol,
             action=Action.SELL,
             strength=0.7,
-            reason="ICT TP at buy-side liquidity",
-            target_price=int(order.take_profit),
-            quantity=order.quantity,
+            reason="ICT intraday partial TP at +1R",
+            target_price=int(tp1),
+            quantity=qty1,
         )
         result = OrderExecutor(env_dv="vps").execute_signal(signal)
         if not result.empty:
@@ -429,14 +438,33 @@ class ICTTradingEngine:
             order.tp_org_no = str(row.get("KRX_FWDG_ORD_ORGNO", ""))
         else:
             self._mark_degraded("take-profit order failed")
+            return
+        if qty2 <= 0 or tp2 <= 0 or tp2 == tp1:
+            return
+        signal2 = Signal(
+            stock_code=order.symbol,
+            stock_name=order.symbol,
+            action=Action.SELL,
+            strength=0.7,
+            reason="ICT intraday final TP at +2R",
+            target_price=int(tp2),
+            quantity=qty2,
+        )
+        result2 = OrderExecutor(env_dv="vps").execute_signal(signal2)
+        if not result2.empty:
+            row2 = result2.iloc[0]
+            order.tp2_order_no = str(row2.get("ODNO", ""))
+            order.tp2_org_no = str(row2.get("KRX_FWDG_ORD_ORGNO", ""))
+        else:
+            self._mark_degraded("final take-profit order failed")
 
-    def _submit_market_exit(self, order: ManagedOrder) -> None:
+    def _submit_market_exit(self, order: ManagedOrder, reason: str = "ICT synthetic stop loss") -> None:
         signal = Signal(
             stock_code=order.symbol,
             stock_name=order.symbol,
             action=Action.SELL,
             strength=1.0,
-            reason="ICT synthetic stop loss",
+            reason=reason,
             quantity=order.quantity,
         )
         result = OrderExecutor(env_dv="vps").execute_signal(signal)
@@ -449,6 +477,33 @@ class ICTTradingEngine:
                 self._daily_loss += max(0.0, (order.entry - order.stop) * order.quantity)
         else:
             self._mark_degraded("synthetic stop market exit failed")
+
+    def _cancel_take_profit_orders(self, position: ManagedOrder) -> bool:
+        targets = [
+            (position.tp_order_no, position.tp_org_no),
+            (position.tp2_order_no, position.tp2_org_no),
+        ]
+        for order_no, org_no in targets:
+            if not order_no:
+                continue
+            if not self._cancel_order(
+                position,
+                "vps",
+                order_no=order_no,
+                org_no=org_no,
+                remove_pending=False,
+            ):
+                self._mark_degraded("take-profit cancel failed before exit")
+                return False
+        pending_orders, pending_ok = data_fetcher.get_pending_orders("vps")
+        if not pending_ok:
+            self._mark_degraded("take-profit cancel status could not be verified before exit")
+            return False
+        for order_no, _org_no in targets:
+            if order_no and self._order_still_pending(order_no, pending_orders):
+                self._mark_degraded("take-profit remains pending after cancel response")
+                return False
+        return True
 
     def _cancel_order(
         self,
@@ -563,6 +618,21 @@ class ICTTradingEngine:
         if total_eval <= 0:
             return False
         return self._daily_loss >= total_eval * self.config.daily_loss_limit_pct
+
+    def _daily_profit_target_reached(self) -> bool:
+        total_eval = self._last_total_eval
+        if total_eval <= 0 or self.config.daily_profit_target_pct <= 0:
+            return False
+        return self._daily_realized >= total_eval * self.config.daily_profit_target_pct
+
+    def _force_exit_due(self, order: ManagedOrder) -> bool:
+        if not self.config.force_exit_time:
+            return False
+        try:
+            deadline = datetime.strptime(self.config.force_exit_time, "%H:%M").time()
+        except ValueError:
+            return False
+        return datetime.now().time() >= deadline
 
     def _cache_status(self, symbol: str) -> dict[str, Any]:
         summary = self.cache.coverage_summary(symbol)

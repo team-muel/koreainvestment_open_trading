@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from .builder import ICTSetupBuilder
+from .intraday import IntradayLiquidityReclaimBuilder
 from .models import Candle, ICTSetup, TradePlan
 
 
@@ -123,8 +124,12 @@ class ReplayResult:
 
 
 class ICTReplayBacktester:
-    def __init__(self, builder: ICTSetupBuilder | None = None, config: ReplayConfig | None = None):
-        self.builder = builder or ICTSetupBuilder()
+    def __init__(
+        self,
+        builder: ICTSetupBuilder | IntradayLiquidityReclaimBuilder | None = None,
+        config: ReplayConfig | None = None,
+    ):
+        self.builder = builder or IntradayLiquidityReclaimBuilder()
         self.config = config or ReplayConfig()
 
     def run(self, symbol: str, candles_1m: list[Candle], ready_dates: set[str] | None = None) -> ReplayResult:
@@ -183,7 +188,9 @@ class ICTReplayBacktester:
         bars_30m = resample_candles(prefix_1m, 30, "30m")
         bars_1h = resample_candles(prefix_1m, 60, "1h")
         bars_4h = resample_candles(prefix_1m, 240, "4h")
-        bars_1d = resample_candles(prefix_1m, 1440, "1d")
+        bars_1d = resample_candles(prefix_1m, 390, "1d")
+        if isinstance(self.builder, IntradayLiquidityReclaimBuilder):
+            return self.builder.build_long_setup(symbol, prefix_1m, bars_1d)
         return self.builder.build_long_setup(symbol, bars_5m, bars_1h, bars_4h, bars_30m, bars_1d)
 
     def _expired(self, index: int, pending: ReplayOrder) -> bool:

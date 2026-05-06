@@ -128,6 +128,9 @@ class TradePlan:
     risk_reward: float
     quantity: int = 0
     reason: str = ""
+    partial_take_profit: float | None = None
+    final_take_profit: float | None = None
+    force_exit_time: str | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,9 @@ class ICTSetup:
                 "entry": self.trade_plan.entry,
                 "stop": self.trade_plan.stop,
                 "take_profit": self.trade_plan.take_profit,
+                "partial_take_profit": self.trade_plan.partial_take_profit,
+                "final_take_profit": self.trade_plan.final_take_profit,
+                "force_exit_time": self.trade_plan.force_exit_time,
                 "risk_reward": self.trade_plan.risk_reward,
                 "quantity": self.trade_plan.quantity,
                 "reason": self.trade_plan.reason,

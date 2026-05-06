@@ -1,7 +1,7 @@
 """Daily ICT workflow helpers.
 
 Premarket:
-    python scripts/ict_daily_workflow.py premarket-scan --max-scan-symbols 100 --watchlist-limit 30
+    python scripts/ict_daily_workflow.py premarket-scan --max-scan-symbols 200 --watchlist-limit 30
 
 Postmarket:
     python scripts/ict_daily_workflow.py postmarket-feedback
@@ -44,8 +44,10 @@ def parse_args() -> argparse.Namespace:
     scan.add_argument("--min-price", type=int, default=2000)
     scan.add_argument("--min-avg-trading-value", type=int, default=3_000_000_000)
     scan.add_argument("--min-last-trading-value", type=int, default=5_000_000_000)
+    scan.add_argument("--min-prev-change-pct", type=float, default=0.01)
+    scan.add_argument("--max-prev-change-pct", type=float, default=0.08)
     scan.add_argument("--daily-lookback-days", type=int, default=25)
-    scan.add_argument("--max-scan-symbols", type=int, default=100)
+    scan.add_argument("--max-scan-symbols", type=int, default=200)
     scan.add_argument("--watchlist-limit", type=int, default=30)
     scan.add_argument("--request-delay", type=float, default=1.0)
     scan.add_argument("--require-ready-cache", action="store_true")
@@ -80,6 +82,8 @@ def run_premarket_scan(args: argparse.Namespace) -> int:
         min_price=args.min_price,
         min_avg_trading_value=args.min_avg_trading_value,
         min_last_trading_value=args.min_last_trading_value,
+        min_prev_change_pct=args.min_prev_change_pct,
+        max_prev_change_pct=args.max_prev_change_pct,
         daily_lookback_days=args.daily_lookback_days,
         max_scan_symbols=args.max_scan_symbols,
         watchlist_limit=args.watchlist_limit,

@@ -26,8 +26,9 @@ class ICTEngineTests(unittest.TestCase):
         config = ICTConfig()
 
         self.assertEqual(config.max_open_positions, 1)
-        self.assertEqual(config.max_daily_entries, 1)
+        self.assertEqual(config.max_daily_entries, 2)
         self.assertEqual(config.max_pending_per_symbol, 1)
+        self.assertEqual(config.daily_loss_limit_pct, 0.005)
 
     def test_ready_cache_requires_dense_intraday_days(self):
         with tempfile.TemporaryDirectory() as tmp:
