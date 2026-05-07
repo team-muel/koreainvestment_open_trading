@@ -1,6 +1,5 @@
-# Oracle Cloud Always Free VM — 4 worker Docker Compose
+# GCP / Oracle Cloud — 4 worker Docker Compose
 # 사용법: docker compose up -d
-version: "3.9"
 
 services:
   # ── 1. 메인 트레이딩 엔진 ──────────────────────────────
@@ -36,7 +35,7 @@ services:
       dockerfile: deploy/Dockerfile
     container_name: kis-api-server
     restart: unless-stopped
-    command: uvicorn strategy_builder.backend.main:app --host 127.0.0.1 --port 8000
+    command: uvicorn strategy_builder.backend.main:app --host 0.0.0.0 --port 8000
     env_file: .env
     volumes:
       - trading_data:/app/data

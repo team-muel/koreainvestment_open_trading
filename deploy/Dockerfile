@@ -13,6 +13,9 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
+# Python 경로 설정 - strategy_builder 하위 모듈들이 'core', 'kis_auth' 등으로 임포트 가능하게
+ENV PYTHONPATH=/app:/app/strategy_builder
+
 # 의존성 먼저 복사 (캐시 활용)
 COPY pyproject.toml ./
 COPY strategy_builder/pyproject.toml ./strategy_builder/
@@ -46,4 +49,4 @@ USER kisbot
 
 EXPOSE 8000
 
-CMD ["uvicorn", "strategy_builder.backend.main:app", "--host", "127.0.0.1", "--port", "8000"]
+CMD ["uvicorn", "strategy_builder.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -510,10 +510,12 @@ class ICTTradingEngine:
                     if not self._cancel_order(pending, "vps", remove_pending=False):
                         return
             elif pending_ok and holding_qty <= 0:
-                pending.missing_pending_checks += 1
-                if pending.missing_pending_checks >= 2:
-                    pending.status = TradeState.CANCELLED
+                with self._lock:
+                    pending.missing_pending_checks += 1
+                    should_cancel = pending.missing_pending_checks >= 2
+                if should_cancel:
                     with self._lock:
+                        pending.status = TradeState.CANCELLED
                         self._pending.pop(symbol, None)
                     return
 

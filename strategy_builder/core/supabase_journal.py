@@ -158,13 +158,15 @@ class SupabaseJournal:
 
             # 중복 방지: 최근 5분 내 동일 ticker 미실행 신호 3건 이상 스킵
             if not action_taken:
+                from datetime import timedelta
+                five_min_ago = (datetime.now(KST) - timedelta(minutes=5)).isoformat()
                 recent = self._client.select(
                     "signals",
                     filters={
                         "ticker": f"eq.{ticker}",
                         "signal_type": f"eq.{signal_type}",
                         "action_taken": "eq.false",
-                        "created_at": f"gte.{datetime.now(KST).replace(minute=datetime.now(KST).minute - 5 if datetime.now(KST).minute >= 5 else 0).isoformat()}",
+                        "created_at": f"gte.{five_min_ago}",
                     },
                     limit=5,
                 )

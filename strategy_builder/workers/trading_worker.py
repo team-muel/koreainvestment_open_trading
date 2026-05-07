@@ -47,13 +47,29 @@ def main() -> None:
         logger.critical("LIVE_TRADING_ENABLED=true — 실전 모드는 아직 지원하지 않습니다. 종료합니다.")
         sys.exit(1)
 
-    # FastAPI 서버 시작 (별도 프로세스로 실행되므로 여기서는 엔진만 초기화)
+    # 엔진 초기화 및 시작
     from core.ict_cache import MinuteBarCache
     from backend.ict_engine import ICTTradingEngine, ICTConfig
 
     cache = MinuteBarCache()
     config = ICTConfig()
     engine = ICTTradingEngine(cache=cache, config=config)
+
+    # Supabase runtime_config에서 감시 종목 로드 (없으면 기본 종목 사용)
+    default_symbols = ["005930", "000660", "035720"]  # 삼성전자, SK하이닉스, 카카오
+    watch_symbols = default_symbols
+    if journal.enabled:
+        symbols_val = journal.get_runtime_config("watch_symbols", "")
+        if symbols_val:
+            watch_symbols = [s.strip() for s in symbols_val.split(",") if s.strip()]
+
+    logger.info("엔진 시작 — 감시 종목: %s", watch_symbols)
+    try:
+        engine.start(watch_symbols)
+        logger.info("ICT 트레이딩 엔진 시작 완료")
+    except Exception:
+        logger.exception("엔진 시작 실패")
+        sys.exit(1)
 
     # Heartbeat 루프
     loop_count = 0
