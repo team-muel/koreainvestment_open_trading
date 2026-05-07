@@ -211,7 +211,7 @@ class IntradayLiquidityReclaimBuilder:
             )
         details["trigger"]["five_min_vwap_close_confirmed"] = True
 
-        if not self._breaks_previous_1m_high(day_bars):
+        if not self._breaks_previous_1m_high(day_bars, sweep_index=sweep_index):
             return ICTSetup(
                 symbol=symbol,
                 trend="neutral",
@@ -366,30 +366,98 @@ class IntradayLiquidityReclaimBuilder:
         return None
 
     def _latest_5m_closes_above_vwap(self, bars: list[Candle], vwap: list[float]) -> bool:
-        if len(bars) < 5:
+        """마지막 완성된 5분봉이 VWAP 위에서 마감했는지 확인.
+
+        minute % 5 == 4 조건 대신 실제 5분봉 resample 후
+        완성된(현재 진행 중이 아닌) 마지막 5분봉의 close를 사용한다.
+        """
+        if len(bars) < 6:
             return False
-        recent = bars[-5:]
-        recent_vwap = vwap[-5:]
-        return recent[-1].timestamp.minute % 5 == 4 and recent[-1].close > recent_vwap[-1]
+
+        # 5분봉 resample: 같은 5분 버킷에 속하는 봉들을 묶어서 OHLCV 합산
+        # bucket key = timestamp를 5분 단위로 내림 (floor)
+        from collections import defaultdict
+        buckets: dict[int, list[tuple[Candle, float]]] = defaultdict(list)
+        for bar, v in zip(bars, vwap):
+            t = bar.timestamp
+            # 5분 버킷: (hour * 60 + minute) // 5
+            bucket_key = (t.hour * 60 + t.minute) // 5
+            buckets[bucket_key].append((bar, v))
+
+        sorted_keys = sorted(buckets.keys())
+        if len(sorted_keys) < 2:
+            return False
+
+        # 현재 진행 중인 버킷(마지막)은 제외, 그 직전 완성된 5분봉 사용
+        last_complete_key = sorted_keys[-2]
+        complete_bars = buckets[last_complete_key]
+
+        # 5분봉 종가 = 버킷 내 마지막 1분봉의 close
+        five_min_close = complete_bars[-1][0].close
+        # 5분봉 VWAP = 버킷 내 마지막 1분봉 시점의 VWAP
+        five_min_vwap = complete_bars[-1][1]
+
+        return five_min_close > five_min_vwap
 
     @staticmethod
-    def _breaks_previous_1m_high(bars: list[Candle]) -> bool:
-        if len(bars) < 2:
+    def _breaks_previous_1m_high(bars: list[Candle], sweep_index: int | None = None) -> bool:
+        """sweep 이후 형성된 swing high 돌파 여부 확인 (MSS/CHoCH 기준).
+
+        단순 직전 봉 고가 비교 대신, sweep 이후 형성된
+        local swing high (좌우 최소 1봉이 낮은 고점)를 찾아 돌파 여부를 확인한다.
+        """
+        if len(bars) < 5:
             return False
-        return bars[-1].close > bars[-2].high
+
+        # sweep 이후 구간만 대상으로 swing high 탐색
+        start = (sweep_index + 1) if sweep_index is not None and sweep_index < len(bars) - 3 else max(0, len(bars) - 20)
+        search_bars = bars[start:]
+
+        if len(search_bars) < 4:
+            return False
+
+        last = bars[-1]
+
+        # swing high: 좌우 각 1봉 이상이 낮은 고점
+        swing_highs: list[float] = []
+        for i in range(1, len(search_bars) - 1):
+            bar = search_bars[i]
+            left = search_bars[i - 1]
+            right = search_bars[i + 1]
+            if bar.high > left.high and bar.high > right.high:
+                swing_highs.append(bar.high)
+
+        if not swing_highs:
+            # swing high가 없으면 직전 N봉 중 최고가로 fallback
+            fallback_high = max(b.high for b in search_bars[:-1])
+            return last.close > fallback_high
+
+        # 가장 최근 swing high 돌파 여부
+        recent_swing_high = swing_highs[-1]
+        return last.close > recent_swing_high
 
     def _volume_confirms(self, bars: list[Candle], lookback: int = 5) -> bool:
         return self._volume_ratio(bars, lookback=lookback) >= self.config.min_volume_ratio
 
     @staticmethod
     def _volume_ratio(bars: list[Candle], lookback: int = 5) -> float:
+        """현재 봉의 거래량 비율 계산.
+
+        거래량 데이터가 없으면 999.0(통과) 대신 0.0(차단)을 반환한다.
+        자동 진입에서는 데이터 없음과 거래량 0을 동일하게 취급해야 안전하다.
+        """
         if len(bars) <= lookback:
             return 0.0
         sample = [bar.volume for bar in bars[-lookback - 1:-1] if bar.volume > 0]
         if not sample:
-            return 999.0
+            return 0.0  # 데이터 없음 → 진입 차단
         average = sum(sample) / len(sample)
-        return bars[-1].volume / average if average > 0 else 0.0
+        if average <= 0:
+            return 0.0
+        current_volume = bars[-1].volume
+        if current_volume <= 0:
+            return 0.0
+        return current_volume / average
 
     @staticmethod
     def _consecutive_closes_above_vwap(bars: list[Candle], vwap: list[float]) -> int:

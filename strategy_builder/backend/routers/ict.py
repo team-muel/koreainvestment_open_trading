@@ -49,10 +49,16 @@ class CachedSetupScanRequest(BaseModel):
 
 
 def _ensure_paper_authenticated() -> None:
+    from backend.ict_engine import LIVE_TRADING_ENABLED
     if not is_authenticated():
         raise HTTPException(status_code=401, detail="KIS authentication is required")
     if get_current_mode() != "vps":
         raise HTTPException(status_code=400, detail="ICT v1 automatic trading is vps paper mode only")
+    if LIVE_TRADING_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="LIVE_TRADING_ENABLED=True blocks paper mode. Set to False in ict_engine.py."
+        )
 
 
 @router.get("/status")

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import logging
 import json
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import pandas as pd
@@ -29,8 +31,15 @@ from core.gcal_reporter import publish_gcal_signal_if_configured
 from core.ict_realtime import RealtimeTickCollector
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
+from core.fill_reconciler import FillReconciler
 
 logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
+
+# 실전 모드 진입을 위한 이중 잠금.
+# vps 모드 확인 외에 이 플래그도 True여야 실전 주문이 허용됨.
+# 실계좌 전환 시에만 True로 변경할 것.
+LIVE_TRADING_ENABLED: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,7 +79,7 @@ class ManagedOrder:
     exit_order_no: str = ""
     exit_org_no: str = ""
     missing_pending_checks: int = 0
-    submitted_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    submitted_at: str = field(default_factory=lambda: datetime.now(KST).isoformat())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,8 +112,11 @@ class ICTTradingEngine:
         self.realtime = RealtimeTickCollector(self.cache, env_dv="vps")
         self.config = config or ICTConfig()
         self.builder = IntradayLiquidityReclaimBuilder()
+        self.fill_reconciler = FillReconciler()
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
+        self._notif_thread: threading.Thread | None = None
+        self._notif_queue: queue.Queue = queue.Queue()
         self._running = False
         self._degraded = False
         self._symbols: list[str] = []
@@ -121,9 +133,19 @@ class ICTTradingEngine:
         self.journal = ICTJournal()
 
     def start(self, symbols: list[str]) -> dict[str, Any]:
+        # 실전 모드 이중 잠금 검사
+        if LIVE_TRADING_ENABLED:
+            raise RuntimeError(
+                "LIVE_TRADING_ENABLED=True but live trading is not yet supported. "
+                "Set LIVE_TRADING_ENABLED=False for paper trading."
+            )
+
         clean_symbols = [s for s in dict.fromkeys(symbols) if len(s) == 6 and s.isdigit()]
         if not clean_symbols:
             raise ValueError("at least one 6-digit domestic stock symbol is required")
+
+        # 재시작 시 상태 복구
+        self._restore_state()
 
         with self._lock:
             self._symbols = clean_symbols
@@ -132,6 +154,11 @@ class ICTTradingEngine:
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._run_loop, name="ict-trading-engine", daemon=True)
                 self._thread.start()
+            if self._notif_thread is None or not self._notif_thread.is_alive():
+                self._notif_thread = threading.Thread(
+                    target=self._notif_worker, name="ict-notif-worker", daemon=True
+                )
+                self._notif_thread.start()
             self.realtime.start(clean_symbols)
         return self.status()
 
@@ -143,6 +170,8 @@ class ICTTradingEngine:
         if cancel_pending:
             for order in pending_orders:
                 self._cancel_pending_entry(order, env_dv)
+        # Drain notification queue
+        self._notif_queue.put(None)
         return self.status()
 
     def status(self) -> dict[str, Any]:
@@ -248,6 +277,93 @@ class ICTTradingEngine:
             return None
         return self._build_setup_from_1m(symbol, bars_1m).to_dict()
 
+    def _restore_state(self) -> None:
+        """재시작 시 KIS API + SQLite에서 상태 복구. 신규 주문은 복구 완료 후에만 허용."""
+        logger.info("ICT engine: restoring state from API + journal...")
+
+        # 1. Load today's daily_risk from SQLite
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        daily = self.journal.load_daily_risk(today)
+        if daily:
+            with self._lock:
+                self._daily_entries = int(daily.get("entries", 0))
+                self._daily_loss = float(daily.get("loss", 0.0))
+                self._daily_realized = float(daily.get("realized", 0.0))
+                self._last_total_eval = int(daily.get("total_eval", 0))
+
+        # 2. Load pending orders from KIS API
+        pending_orders, pending_ok = data_fetcher.get_pending_orders("vps")
+
+        # 3. Load current holdings from KIS API
+        holdings, holdings_ok = data_fetcher.get_holdings_checked("vps")
+
+        # 4. Load saved orders from SQLite
+        saved_orders = self.journal.load_orders(status_filter=["LIMIT_SUBMITTED", "ENTERED"])
+
+        # 5. Reconstruct _pending and _positions from saved orders + API state
+        for saved in saved_orders:
+            symbol = saved.get("symbol", "")
+            order_no = saved.get("order_no", "")
+            if not symbol or not order_no:
+                continue
+
+            # Check if still pending in API
+            is_api_pending = False
+            if pending_ok and not pending_orders.empty and "order_no" in pending_orders.columns:
+                matched = pending_orders[pending_orders["order_no"].astype(str) == str(order_no)]
+                is_api_pending = not matched.empty
+
+            # Check if in holdings
+            holding_qty = 0
+            if holdings_ok and not holdings.empty and "stock_code" in holdings.columns:
+                matched = holdings[holdings["stock_code"] == symbol]
+                if not matched.empty:
+                    holding_qty = int(matched.iloc[0].get("quantity", 0))
+
+            order = ManagedOrder(
+                symbol=symbol,
+                side=saved.get("side", "buy"),
+                order_no=order_no,
+                org_no=saved.get("org_no", ""),
+                quantity=saved.get("quantity", 0),
+                filled_quantity=saved.get("filled_qty", 0),
+                price=saved.get("price", 0.0),
+                entry=saved.get("entry", 0.0),
+                stop=saved.get("stop", 0.0),
+                take_profit=saved.get("take_profit", 0.0),
+                tp_order_no=saved.get("tp_order_no", ""),
+                tp2_order_no=saved.get("tp2_order_no", ""),
+                exit_order_no=saved.get("exit_order_no", ""),
+                submitted_at=saved.get("submitted_at", datetime.now(KST).isoformat()),
+            )
+
+            if holding_qty > 0:
+                order.status = TradeState.ENTERED
+                order.quantity = holding_qty
+                with self._lock:
+                    self._positions[symbol] = order
+                logger.info("ICT restore: %s -> position (qty=%d)", symbol, holding_qty)
+            elif is_api_pending:
+                order.status = TradeState.LIMIT_SUBMITTED
+                with self._lock:
+                    self._pending[symbol] = order
+                logger.info("ICT restore: %s -> pending", symbol)
+            else:
+                logger.info("ICT restore: %s order %s not found in API -> skipping", symbol, order_no)
+
+        with self._lock:
+            pending_count = len(self._pending)
+            position_count = len(self._positions)
+
+        logger.info(
+            "ICT engine restore complete: %d pending, %d positions, daily_entries=%d, loss=%.0f, realized=%.0f",
+            pending_count,
+            position_count,
+            self._daily_entries,
+            self._daily_loss,
+            self._daily_realized,
+        )
+
     def _run_loop(self) -> None:
         while True:
             with self._lock:
@@ -268,13 +384,15 @@ class ICTTradingEngine:
             time.sleep(self.config.loop_interval_seconds)
 
     def _warmup_today(self, symbol: str) -> None:
-        today = datetime.now().strftime("%Y%m%d")
+        today = datetime.now(KST).strftime("%Y%m%d")
         if self._warmup_dates.get(symbol) == today:
             return
         df = data_fetcher.get_intraday_minute_prices(symbol, env_dv="vps", max_pages=3)
-        self._warmup_dates[symbol] = today
         if df.empty:
+            # 데이터 실패 시 캐시하지 않음 → 다음 루프에서 재시도 가능
+            logger.warning("_warmup_today: empty data for %s, will retry next loop", symbol)
             return
+        self._warmup_dates[symbol] = today
         self.cache.upsert_bars(symbol, self._df_to_candles(symbol, df))
 
     def _collect_current_price(self, symbol: str) -> None:
@@ -282,7 +400,7 @@ class ICTTradingEngine:
         price = float(data.get("price", 0) or 0)
         volume = int(data.get("volume", 0) or 0)
         if price > 0:
-            self.cache.upsert_tick_as_minute(symbol, datetime.now(), price, volume, source="poll")
+            self.cache.upsert_tick_as_minute(symbol, datetime.now(KST), price, volume, source="poll")
 
     def _evaluate_symbol(self, symbol: str) -> None:
         bars_1m = self.cache.get_1m_bars(symbol, limit=8000)
@@ -297,6 +415,13 @@ class ICTTradingEngine:
             return
         with self._lock:
             if symbol in self._pending or symbol in self._positions:
+                return
+            # max_pending_per_symbol 실제 적용
+            pending_count_for_symbol = sum(1 for s in self._pending if s == symbol)
+            if pending_count_for_symbol >= self.config.max_pending_per_symbol:
+                return
+            total_pending = len(self._pending)
+            if total_pending >= self.config.max_pending_per_symbol * len(self._symbols):
                 return
             if len(self._positions) >= self.config.max_open_positions:
                 return
@@ -313,6 +438,8 @@ class ICTTradingEngine:
             return
         quantity = self._calculate_quantity(setup.trade_plan)
         if quantity <= 0:
+            return
+        if not self._order_feasible(setup.trade_plan.symbol, setup.trade_plan, quantity):
             return
         self._record_signal_if_changed(setup.to_dict(), action_taken=True)
         self._submit_entry(setup.trade_plan, quantity)
@@ -353,6 +480,7 @@ class ICTTradingEngine:
             self._pending[plan.symbol] = order
             self._daily_entries += 1
         self.journal.record_trade_event("ENTRY_SUBMITTED", order.to_dict(), {"entry_reason": plan.reason})
+        self.journal.save_order(order.to_dict())
         self._publish_signal_calendar_event(plan, quantity)
 
     def _manage_position(self, symbol: str) -> None:
@@ -399,6 +527,7 @@ class ICTTradingEngine:
             with self._lock:
                 self._positions[symbol] = pending
                 self._pending.pop(symbol, None)
+            self.journal.save_position(symbol, pending.to_dict())
             self._submit_take_profit(pending)
 
         with self._lock:
@@ -407,15 +536,44 @@ class ICTTradingEngine:
             return
         if holdings_ok and holding_qty <= 0:
             position.status = TradeState.CLOSED
-            estimated_exit = position.take_profit if position.take_profit > 0 else position.entry
-            estimated_pnl = (estimated_exit - position.entry) * position.quantity
+            # Use FillReconciler for actual exit fill
+            fill_result = self.fill_reconciler.reconcile(
+                order_no=position.exit_order_no or position.order_no,
+                symbol=position.symbol,
+                side="sell",
+                quantity=position.quantity,
+                entry_price=position.entry,
+                env_dv="vps",
+            )
+            if fill_result.is_complete:
+                with self._lock:
+                    self._daily_realized += fill_result.realized_pnl
+                    self._daily_loss += min(0.0, fill_result.realized_pnl)
+            else:
+                # Fall back to estimated value with warning
+                logger.warning(
+                    "FillReconciler incomplete for %s, using estimated exit value",
+                    position.symbol,
+                )
+                estimated_exit = position.take_profit if position.take_profit > 0 else position.entry
+                estimated_pnl = (estimated_exit - position.entry) * position.quantity
+                with self._lock:
+                    self._daily_realized += estimated_pnl
             with self._lock:
-                self._daily_realized += estimated_pnl
                 self._positions.pop(symbol, None)
             self.journal.record_trade_event(
                 "POSITION_CLOSED",
                 position.to_dict(),
-                {"exit_reason": "holding quantity is zero; estimated close from broker holdings check"},
+                {"exit_reason": "holding quantity is zero; reconciled from broker holdings check"},
+            )
+            self.journal.save_position(symbol, None)
+            today = datetime.now(KST).strftime("%Y-%m-%d")
+            self.journal.save_daily_risk(
+                today,
+                self._daily_entries,
+                self._daily_loss,
+                self._daily_realized,
+                self._last_total_eval,
             )
             return
         if position.status == TradeState.EXITING:
@@ -492,10 +650,9 @@ class ICTTradingEngine:
                 order.status = TradeState.EXITING
                 order.exit_order_no = str(row.get("ODNO", ""))
                 order.exit_org_no = str(row.get("KRX_FWDG_ORD_ORGNO", ""))
-                self._daily_loss += max(0.0, (order.entry - order.stop) * order.quantity)
             self.journal.record_trade_event("EXIT_SUBMITTED", order.to_dict(), {"exit_reason": reason})
         else:
-            self._mark_degraded("synthetic stop market exit failed")
+            self._emergency_stop("market exit submission failed")
 
     def _cancel_take_profit_orders(self, position: ManagedOrder) -> bool:
         targets = [
@@ -512,7 +669,7 @@ class ICTTradingEngine:
                 org_no=org_no,
                 remove_pending=False,
             ):
-                self._mark_degraded("take-profit cancel failed before exit")
+                self._emergency_stop("take-profit cancel failed before exit")
                 return False
         pending_orders, pending_ok = data_fetcher.get_pending_orders("vps")
         if not pending_ok:
@@ -520,7 +677,7 @@ class ICTTradingEngine:
             return False
         for order_no, _org_no in targets:
             if order_no and self._order_still_pending(order_no, pending_orders):
-                self._mark_degraded("take-profit remains pending after cancel response")
+                self._emergency_stop("take-profit remains pending after cancel response")
                 return False
         return True
 
@@ -598,7 +755,53 @@ class ICTTradingEngine:
         buyable_qty = int(buyable.get("quantity", 0) or 0)
         return max(0, min(risk_qty, max_position_qty, buyable_qty))
 
+    def _order_feasible(self, symbol: str, plan: TradePlan, quantity: int) -> bool:
+        """거래대금 + 호가 깊이 기반 주문 체결 가능성 사전 필터링.
+
+        주문하려는 수량이 매도 호가 잔량에 비해 과도하게 크면
+        체결 슬리피지가 발생하거나 부분체결 후 잔량이 남을 위험이 있다.
+        """
+        if quantity <= 0:
+            return False
+
+        orderbook = data_fetcher.get_orderbook(symbol, "vps")
+        if not orderbook:
+            return True  # 호가 정보 없으면 통과 (보수적으로 허용)
+
+        ask_prices = orderbook.get("ask_prices") or []
+        ask_volumes = orderbook.get("ask_volumes") or []
+
+        if not ask_prices or not ask_volumes:
+            return True
+
+        # 1차 호가 잔량 대비 주문 수량 비율
+        best_ask_volume = int(ask_volumes[0]) if ask_volumes else 0
+        if best_ask_volume > 0 and quantity > best_ask_volume * 0.5:
+            # 1차 호가 잔량의 50% 초과 주문은 시장 충격 위험
+            logger.info(
+                "_order_feasible: %s qty=%d > 50%% of best ask volume=%d → skip",
+                symbol, quantity, best_ask_volume
+            )
+            return False
+
+        # 상위 3개 호가 합산 잔량 vs 주문 수량
+        total_ask_volume = sum(int(v) for v in ask_volumes[:3] if v)
+        if total_ask_volume > 0 and quantity > total_ask_volume * 0.3:
+            logger.info(
+                "_order_feasible: %s qty=%d > 30%% of top-3 ask volume=%d → skip",
+                symbol, quantity, total_ask_volume
+            )
+            return False
+
+        return True
+
     def _spread_ok(self, symbol: str, entry: float) -> bool:
+        """spread가 tick cap AND % cap 동시 만족 시에만 통과.
+
+        max() 기준 단일 임계값은 tick이 작은 저가주에서 % cap이 무력화되거나
+        고가주에서 tick cap이 무력화될 수 있어 위험하다.
+        두 조건을 동시 만족해야 스프레드가 안전한 수준임을 보장한다.
+        """
         orderbook = data_fetcher.get_orderbook(symbol, "vps")
         if not orderbook:
             return False
@@ -606,9 +809,20 @@ class ICTTradingEngine:
         bid_prices = orderbook.get("bid_prices") or []
         if not ask_prices or not bid_prices:
             return False
-        spread = float(ask_prices[0]) - float(bid_prices[0])
-        threshold = max(krx_tick_size(entry) * 3, entry * 0.003)
-        return spread <= threshold
+        best_ask = float(ask_prices[0])
+        best_bid = float(bid_prices[0])
+        if best_ask <= 0 or best_bid <= 0:
+            return False
+        spread = best_ask - best_bid
+        tick = krx_tick_size(entry)
+
+        # tick cap: 호가단위의 3배 이하
+        tick_cap = tick * 3
+        # % cap: entry 기준 0.3% 이하
+        pct_cap = entry * 0.003
+
+        # 두 조건 동시 만족 필요 (AND)
+        return spread <= tick_cap and spread <= pct_cap
 
     def _market_exception_ok(self, symbol: str) -> bool:
         price_data = data_fetcher.get_current_price(symbol, "vps")
@@ -660,13 +874,117 @@ class ICTTradingEngine:
             deadline = datetime.strptime(self.config.force_exit_time, "%H:%M").time()
         except ValueError:
             return False
-        return datetime.now().time() >= deadline
+        return datetime.now(KST).time() >= deadline
 
     def _cache_status(self, symbol: str) -> dict[str, Any]:
         summary = self.cache.coverage_summary(symbol)
         ready_days = int(summary["ready_coverage_days"])
         summary["state"] = "READY" if ready_days >= self.config.min_cache_days else "WARMING_UP"
         return summary
+
+    def _engine_state_dict(self) -> dict[str, Any]:
+        """Return current engine state for persistence."""
+        return {
+            "updated_at": datetime.now(KST).isoformat(),
+            "running": self._running,
+            "degraded": self._degraded,
+            "daily_entries": self._daily_entries,
+            "daily_loss": self._daily_loss,
+            "daily_realized": self._daily_realized,
+            "last_total_eval": self._last_total_eval,
+            "last_error": self._last_error or "",
+            "symbols_json": json.dumps(self._symbols),
+            "warmup_dates_json": json.dumps(self._warmup_dates),
+        }
+
+    def _notif_worker(self) -> None:
+        """Notification worker - runs in separate thread, never blocks trading loop."""
+        while True:
+            try:
+                item = self._notif_queue.get(timeout=5)
+                if item is None:
+                    break
+                task = item.get("task")
+                try:
+                    if task == "gcal_signal":
+                        publish_gcal_signal_if_configured(
+                            ticker=item["ticker"],
+                            title=item["title"],
+                            description=item["description"],
+                            event_dt=item["event_dt"],
+                        )
+                except Exception:
+                    logger.exception("notif_worker: failed to process %s", task)
+                finally:
+                    self._notif_queue.task_done()
+            except queue.Empty:
+                with self._lock:
+                    if not self._running:
+                        break
+
+    def _emergency_stop(self, reason: str) -> None:
+        """치명적 오류 시 엔진 즉시 정지 + 알림."""
+        logger.critical("ICT ENGINE EMERGENCY STOP: %s", reason)
+        with self._lock:
+            self._running = False
+            self._degraded = True
+            self._last_error = f"[EMERGENCY STOP] {reason}"
+        # journal에 기록
+        self.journal.record_trade_event(
+            "EMERGENCY_STOP",
+            {"symbol": "ENGINE", "side": "none", "order_no": ""},
+            {"exit_reason": reason},
+        )
+        # notification queue에 알림 요청
+        self._notif_queue.put({
+            "task": "gcal_signal",
+            "ticker": "ENGINE",
+            "title": "EMERGENCY STOP",
+            "description": f"ICT engine stopped: {reason}",
+            "event_dt": datetime.now(KST),
+        })
+
+    def _mark_degraded(self, message: str) -> None:
+        logger.error("ICT engine degraded: %s", message)
+        with self._lock:
+            self._degraded = True
+            self._last_error = message
+        self.journal.save_engine_state(self._engine_state_dict())
+
+    def _record_signal_if_changed(self, setup: dict[str, Any], action_taken: bool) -> None:
+        symbol = str(setup.get("symbol") or "")
+        if not symbol:
+            return
+        fingerprint_payload = {
+            "state": setup.get("state"),
+            "trade_plan": setup.get("trade_plan"),
+            "notes": setup.get("notes", [])[-3:],
+            "trigger": (setup.get("details") or {}).get("trigger", {}),
+        }
+        fingerprint = json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False, default=str)
+        with self._lock:
+            if self._last_signal_fingerprint.get(symbol) == fingerprint and not action_taken:
+                return
+            self._last_signal_fingerprint[symbol] = fingerprint
+        reason_not_taken = "" if action_taken else "; ".join(setup.get("notes", [])[-3:])
+        self.journal.record_signal(setup, action_taken=action_taken, reason_not_taken=reason_not_taken)
+
+    def _publish_signal_calendar_event(self, plan: TradePlan, quantity: int) -> None:
+        """매매 루프를 블록하지 않도록 notification worker에 위임."""
+        self._notif_queue.put({
+            "task": "gcal_signal",
+            "ticker": plan.symbol,
+            "title": "Buy submitted",
+            "description": (
+                f"Setup: {plan.reason}\n"
+                f"Entry: {plan.entry:,.0f}\n"
+                f"Stop: {plan.stop:,.0f}\n"
+                f"Target: {plan.take_profit:,.0f}\n"
+                f"Quantity: {quantity}\n"
+                "Action: monitor fill, TP, VWAP reclaim failure, and force-exit rules."
+            ),
+            "event_dt": datetime.now(KST),
+        })
 
     @staticmethod
     def _pending_snapshot(order: ManagedOrder, pending_orders: pd.DataFrame) -> dict[str, int] | None:
@@ -695,49 +1013,6 @@ class ICTTradingEngine:
         if "unfilled_qty" not in matched.columns:
             return True
         return int(matched.iloc[0].get("unfilled_qty", 0) or 0) > 0
-
-    def _mark_degraded(self, message: str) -> None:
-        logger.error("ICT engine degraded: %s", message)
-        with self._lock:
-            self._degraded = True
-            self._last_error = message
-
-    def _record_signal_if_changed(self, setup: dict[str, Any], action_taken: bool) -> None:
-        symbol = str(setup.get("symbol") or "")
-        if not symbol:
-            return
-        fingerprint_payload = {
-            "state": setup.get("state"),
-            "trade_plan": setup.get("trade_plan"),
-            "notes": setup.get("notes", [])[-3:],
-            "trigger": (setup.get("details") or {}).get("trigger", {}),
-        }
-        fingerprint = json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False, default=str)
-        with self._lock:
-            if self._last_signal_fingerprint.get(symbol) == fingerprint and not action_taken:
-                return
-            self._last_signal_fingerprint[symbol] = fingerprint
-        reason_not_taken = "" if action_taken else "; ".join(setup.get("notes", [])[-3:])
-        self.journal.record_signal(setup, action_taken=action_taken, reason_not_taken=reason_not_taken)
-
-    @staticmethod
-    def _publish_signal_calendar_event(plan: TradePlan, quantity: int) -> None:
-        try:
-            publish_gcal_signal_if_configured(
-                ticker=plan.symbol,
-                title="Buy submitted",
-                description=(
-                    f"Setup: {plan.reason}\n"
-                    f"Entry: {plan.entry:,.0f}\n"
-                    f"Stop: {plan.stop:,.0f}\n"
-                    f"Target: {plan.take_profit:,.0f}\n"
-                    f"Quantity: {quantity}\n"
-                    "Action: monitor fill, TP, VWAP reclaim failure, and force-exit rules."
-                ),
-                event_dt=datetime.now(),
-            )
-        except Exception:
-            logger.exception("failed to publish ICT signal calendar event")
 
     @staticmethod
     def _df_to_candles(symbol: str, df: pd.DataFrame) -> list[Candle]:

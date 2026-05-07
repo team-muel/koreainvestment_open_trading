@@ -41,6 +41,10 @@ class UniverseFilterConfig:
     request_delay: float = 1.0
     require_ready_cache: bool = False
     use_volume_rank: bool = True
+    exclude_sector_momentum: bool = True   # 섹터 전체 급등 시 제외
+    exclude_vi_risk: bool = True           # VI 발동 위험 종목 제외
+    vi_risk_change_pct: float = 0.05       # 전일 대비 5% 이상 = VI 위험
+    exclude_expected_fill_risk: bool = True # 예상체결가 괴리 큰 종목 제외
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,11 @@ class KRXUniverseScanner:
             time.sleep(config.request_delay)
 
         ranked = sorted(candidates, key=lambda item: item.avg_trading_value, reverse=True)
+
+        # 섹터 동조 필터: 동일 섹터에서 최대 3종목만 유지 (섹터명은 symbol.name 기반 추정)
+        if config.exclude_sector_momentum:
+            ranked = self._apply_sector_limit(ranked, max_per_sector=3)
+
         watchlist = []
         for rank, candidate in enumerate(ranked[: config.watchlist_limit], start=1):
             item = candidate.to_dict()
@@ -226,6 +235,19 @@ class KRXUniverseScanner:
         if config.require_ready_cache and ready_days < 20:
             return None
 
+        # VI 위험 필터: 전일 대비 등락률이 VI 발동 임박 수준이면 제외
+        if config.exclude_vi_risk and abs(prev_change_pct) >= config.vi_risk_change_pct:
+            return None
+
+        # 예상체결가 괴리 필터: 현재가가 전일 종가 대비 너무 멀면 제외
+        # (장 시작 전 예상체결가가 크게 벌어진 경우)
+        price_data = data_fetcher.get_current_price(symbol.code, env_dv)
+        current_price = float(price_data.get("price", 0) or 0)
+        if config.exclude_expected_fill_risk and current_price > 0 and prev_close > 0:
+            expected_gap = abs(current_price - prev_close) / prev_close
+            if expected_gap > 0.05:  # 5% 이상 갭이면 제외
+                return None
+
         setup = self._build_setup_from_cache(symbol.code)
         liquidity_level = self._liquidity_level(prev_high_distance_pct, prev_low_distance_pct)
         ict_setup = self._ict_setup_text(prev_high_distance_pct, prev_low_distance_pct, recent_high, recent_low, last_close)
@@ -254,6 +276,24 @@ class KRXUniverseScanner:
             ready_coverage_days=ready_days,
             setup=None if setup is None else setup.to_dict(),
         )
+
+    @staticmethod
+    def _apply_sector_limit(candidates: list[UniverseCandidate], max_per_sector: int = 3) -> list[UniverseCandidate]:
+        """섹터 동조 방지: 동일 섹터 종목은 최대 max_per_sector개만 유지.
+
+        정확한 섹터 분류 API가 없으므로 ict_setup 텍스트와
+        avg_trading_value 기준으로 순위 내 중복을 제한한다.
+        """
+        seen: dict[str, int] = {}
+        result: list[UniverseCandidate] = []
+        for candidate in candidates:
+            # ict_setup을 섹터 대리 지표로 사용
+            sector_key = candidate.ict_setup[:30]
+            count = seen.get(sector_key, 0)
+            if count < max_per_sector:
+                result.append(candidate)
+                seen[sector_key] = count + 1
+        return result
 
     def _liquidity_first_order(
         self,
