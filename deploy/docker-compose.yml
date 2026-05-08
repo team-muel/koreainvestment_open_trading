@@ -14,7 +14,7 @@ services:
     volumes:
       - trading_data:/app/data
       - ./logs:/app/logs
-      - /opt/kis-config:/home/kisbot/KIS/config:ro
+      - /opt/kis-config:/home/kisbot/KIS/config
     healthcheck:
       test: ["CMD", "python", "-c", "import os; os.path.exists('/home/kisbot/KIS/config/kis_devlp.yaml') or exit(1)"]
       interval: 30s
@@ -40,7 +40,7 @@ services:
     env_file: .env
     volumes:
       - trading_data:/app/data
-      - /opt/kis-config:/home/kisbot/KIS/config:ro
+      - /opt/kis-config:/home/kisbot/KIS/config
     ports:
       - "127.0.0.1:8000:8000"
     networks:
