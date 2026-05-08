@@ -14,8 +14,9 @@ services:
     volumes:
       - trading_data:/app/data
       - ./logs:/app/logs
+      - /opt/kis-config:/home/kisbot/KIS/config:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; r=requests.get('http://localhost:8000/api/health', timeout=3); r.raise_for_status()"]
+      test: ["CMD", "python", "-c", "import os; os.path.exists('/home/kisbot/KIS/config/kis_devlp.yaml') or exit(1)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -39,6 +40,7 @@ services:
     env_file: .env
     volumes:
       - trading_data:/app/data
+      - /opt/kis-config:/home/kisbot/KIS/config:ro
     ports:
       - "127.0.0.1:8000:8000"
     networks:
