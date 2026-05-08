@@ -43,10 +43,15 @@ COPY . .
 # 데이터 디렉토리 생성
 RUN mkdir -p /app/data /app/logs
 
+# entrypoint 스크립트 등록 (컨테이너 시작 시 kis_devlp.yaml 자동 생성)
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # 비루트 사용자로 실행 (보안)
 RUN useradd -m -u 1000 kisbot && chown -R kisbot:kisbot /app
 USER kisbot
 
 EXPOSE 8000
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "strategy_builder.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
