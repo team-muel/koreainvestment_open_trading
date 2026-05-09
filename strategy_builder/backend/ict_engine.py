@@ -560,6 +560,23 @@ class ICTTradingEngine:
             self._record_entry_block(setup.to_dict(), "ORDER_NOT_FEASIBLE")
             return
         self._record_signal_if_changed(setup.to_dict(), action_taken=True)
+
+        # Risk Review Agent: 진입 근거 설명 생성 (비동기, 주문은 코드가 결정)
+        import threading
+        plan_dict = {
+            "symbol": setup.trade_plan.symbol,
+            "entry": setup.trade_plan.entry,
+            "stop": setup.trade_plan.stop,
+            "take_profit": setup.trade_plan.take_profit,
+            "quantity": quantity,
+            "reason": setup.trade_plan.reason,
+        }
+        threading.Thread(
+            target=self._run_risk_review,
+            args=(plan_dict, self.status(), setup.to_dict().get("details", {}).get("trigger")),
+            daemon=True,
+        ).start()
+
         self._submit_entry(setup.trade_plan, quantity, setup_id=setup_id)
 
     def _build_setup_from_1m(self, symbol: str, bars_1m: list[Candle]):
@@ -1188,5 +1205,16 @@ class ICTTradingEngine:
         fees = avg_price * qty * (self.config.entry_fee_rate + self.config.exit_fee_rate)
         tax = avg_price * qty * self.config.exit_tax_rate
         return gross_pnl - fees - tax
+
+
+    def _run_risk_review(self, plan_dict: dict, engine_status: dict, signal_trigger: dict | None = None) -> None:
+        """Risk Review Agent 비동기 실행 (주문 결정과 무관한 설명 생성)."""
+        try:
+            from agents.risk_review_agent import RiskReviewAgent
+            agent = RiskReviewAgent()
+            result = agent.review(plan_dict, engine_status, signal_detail=signal_trigger)
+            logger.info(agent.format_for_log(result))
+        except Exception:
+            logger.debug("RiskReviewAgent 실행 실패 (비필수)")
 
 ict_engine = ICTTradingEngine()

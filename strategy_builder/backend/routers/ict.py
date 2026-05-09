@@ -196,6 +196,20 @@ def _run_premarket_workflow() -> dict:
 
         payload = {"scan_date": scan_date, "watchlist_count": len(watchlist), "symbols": top_symbols}
         journal.finish_job("premarket", scan_date, success=True, payload=payload)
+
+        # Pre-market Reason Agent 비동기 실행 (LLM 근거 작성 + Notion 업데이트)
+        try:
+            from agents.premarket_agent import PremarketAgent
+            import threading
+            threading.Thread(
+                target=lambda: PremarketAgent().run(trade_date=scan_date),
+                name="premarket-reason-agent",
+                daemon=True,
+            ).start()
+            logger.info("Pre-market Reason Agent 백그라운드 시작")
+        except Exception:
+            logger.exception("Pre-market Reason Agent 시작 실패 (비필수)")
+
         return {"status": "success", **payload}
 
     except Exception as e:

@@ -333,6 +333,27 @@ class DailyReportWorker:
                             metrics["win_rate"] * 100,
                         )
                         last_execution_date = current_date
+
+                        # Audit Agent + Daily Report Agent 비동기 실행
+                        import threading
+                        def _run_agents(date_str):
+                            try:
+                                from agents.daily_report_agent import DailyReportAgent
+                                DailyReportAgent().run(trade_date=date_str)
+                            except Exception as e:
+                                logger.warning("DailyReportAgent 실패: %s", e)
+                            try:
+                                from agents.audit_agent import AuditAgent
+                                AuditAgent().run(trade_date=date_str)
+                            except Exception as e:
+                                logger.warning("AuditAgent 실패: %s", e)
+                        threading.Thread(
+                            target=_run_agents,
+                            args=(current_date,),
+                            name="post-market-agents",
+                            daemon=True,
+                        ).start()
+                        logger.info("장후 AI 에이전트 백그라운드 시작 (DailyReport + Audit)")
                     else:
                         # 이미 오늘 실행했으면 다음날까지 대기
                         time.sleep(3600)  # 1시간마다 확인
