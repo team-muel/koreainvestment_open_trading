@@ -26,6 +26,7 @@ class IntradayReclaimConfig:
     vwap_confirm_closes: int = 2
     min_volume_ratio: float = 1.5
     min_entry_buffer_ticks: int = 1
+    sweep_mode: str = "strict"  # "strict": 동일봉 리클레임, "delayed": 3봉 이내 허용
     partial_r: float = 1.0
     final_r: float = 2.0
     min_rr: float = 1.5
@@ -121,13 +122,21 @@ class IntradayLiquidityReclaimBuilder:
         reclaim_index = self._find_reclaim(day_bars, sweep_index, sweep_level)
         sweep_low = min(bar.low for bar in day_bars[sweep_index: min(len(day_bars), sweep_index + self.config.reclaim_bars + 1)])
         sweep_depth_pct = (sweep_level - sweep_low) / sweep_level if sweep_level > 0 else 0.0
+        # sweep_type: strict(동봉) vs delayed(이후봉 리클레임)
+        sweep_candle = day_bars[sweep_index]
+        if sweep_candle.low < sweep_level and sweep_candle.close > sweep_level:
+            sweep_type = "STRICT_SAME_CANDLE"
+        else:
+            sweep_type = "DELAYED_RECLAIM"
+
         details["trigger"].update({
             "liquidity_level": sweep_level,
             "sweep_index": sweep_index,
-            "sweep_time": day_bars[sweep_index].timestamp.isoformat(),
+            "sweep_time": sweep_candle.timestamp.isoformat(),
             "sweep_low": sweep_low,
             "sweep_depth_pct": sweep_depth_pct,
             "sweep_confirmed": sweep_depth_pct >= self.config.min_sweep_pct,
+            "sweep_type": sweep_type,
         })
         if sweep_depth_pct < self.config.min_sweep_pct:
             return self._setup(
@@ -344,11 +353,24 @@ class IntradayLiquidityReclaimBuilder:
         return previous[-1].high
 
     def _find_long_sweep(self, bars: list[Candle], levels: list[float]) -> tuple[int, float] | None:
+        """Sell-side sweep 탐지.
+
+        strict(기본): 같은 봉 안에서 level 아래 이탈 후 level 위 종가.
+        delayed:      level 아래 이탈 후 reclaim_bars봉 이내 level 위 종가 회복.
+        """
         start = next((i for i, bar in enumerate(bars) if bar.timestamp.time() >= self.config.opening_range_end), 0)
         for i in range(start, len(bars)):
             for level in levels:
-                if bars[i].low < level and bars[i].close > level:
-                    return i, level
+                if bars[i].low < level:
+                    # Strict: 같은 봉 리클레임
+                    if bars[i].close > level:
+                        return i, level
+                    # Delayed: reclaim_bars봉 이내 리클레임
+                    if self.config.sweep_mode == "delayed":
+                        end = min(len(bars), i + self.config.reclaim_bars + 1)
+                        for j in range(i + 1, end):
+                            if bars[j].close > level:
+                                return i, level  # sweep_index = 최초 이탈봉
         return None
 
     def _find_reclaim(self, bars: list[Candle], sweep_index: int, level: float) -> int | None:

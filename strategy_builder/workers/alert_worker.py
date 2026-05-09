@@ -1,14 +1,4 @@
-"""Alert Worker — Telegram/Discord 즉시 알림 처리.
-
-메인 트레이딩 루프와 분리된 별도 프로세스로 실행.
-큐(Redis 또는 간단히 Supabase polling) 기반으로 알림 이벤트를 처리한다.
-
-환경변수:
-    TELEGRAM_BOT_TOKEN   BotFather에서 발급받은 봇 토큰
-    TELEGRAM_CHAT_ID     알림 받을 채팅 ID (개인 또는 그룹)
-    SUPABASE_URL         Supabase 프로젝트 URL
-    SUPABASE_KEY         Supabase service role key
-"""
+"""Alert Worker - Telegram notification handling."""
 from __future__ import annotations
 
 import logging
@@ -23,11 +13,11 @@ import requests
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
-POLL_INTERVAL = 5  # 초
+POLL_INTERVAL = 5
 
 
 class TelegramAlerter:
-    """Telegram Bot API를 통한 알림 전송."""
+    """Telegram Bot API alerter."""
 
     BASE = "https://api.telegram.org"
 
@@ -36,7 +26,7 @@ class TelegramAlerter:
         self.chat_id = chat_id
 
     def send(self, message: str, parse_mode: str = "HTML") -> bool:
-        """메시지 전송. 실패해도 예외를 throw하지 않음."""
+        """Send message."""
         try:
             resp = requests.post(
                 f"{self.BASE}/bot{self.token}/sendMessage",
@@ -131,7 +121,7 @@ class TelegramAlerter:
 
 
 class AlertWorker:
-    """Supabase를 polling해서 미처리 알림 이벤트를 Telegram으로 전송."""
+    """Supabase polling alert worker."""
 
     def __init__(self):
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -142,7 +132,6 @@ class AlertWorker:
         else:
             self.alerter = TelegramAlerter(token, chat_id)
 
-        # Supabase 연결
         url = os.environ.get("SUPABASE_URL", "").strip()
         key = os.environ.get("SUPABASE_KEY", "").strip()
         self.supabase_url = url
@@ -150,6 +139,7 @@ class AlertWorker:
         self._last_signal_id: str | None = None
         self._last_fill_id: str | None = None
         self._last_heartbeat_check = datetime.now(KST)
+        self._sent_daily_report_dates: set[str] = set()
 
     def _supabase_get(self, path: str, params: dict | None = None) -> list[dict]:
         if not self.supabase_url:
@@ -169,7 +159,7 @@ class AlertWorker:
             return []
 
     def _check_new_signals(self) -> None:
-        """새로운 실행된 시그널 알림."""
+        """Check for new signals."""
         if not self.alerter:
             return
         params = {
@@ -185,7 +175,7 @@ class AlertWorker:
             self._last_signal_id = row.get("id")
 
     def _check_new_fills(self) -> None:
-        """새로운 체결 알림."""
+        """Check for new fills."""
         if not self.alerter:
             return
         params = {
@@ -201,7 +191,7 @@ class AlertWorker:
             self._last_fill_id = row.get("id")
 
     def _check_emergency_stops(self) -> None:
-        """EMERGENCY_STOP 이벤트 알림."""
+        """Check for emergency stops."""
         if not self.alerter:
             return
         rows = self._supabase_get("trade_journal", {
@@ -216,7 +206,7 @@ class AlertWorker:
             self.alerter.send_emergency_stop(f"{reason} (at {created})")
 
     def _check_heartbeat(self) -> None:
-        """trading-worker heartbeat 5분 이상 없으면 알림."""
+        """Check heartbeat."""
         if not self.alerter:
             return
         now = datetime.now(KST)
@@ -237,13 +227,44 @@ class AlertWorker:
             from datetime import timezone
             beat_at = datetime.fromisoformat(beat_at_str.replace("Z", "+00:00"))
             elapsed = (now.astimezone(timezone.utc) - beat_at.astimezone(timezone.utc)).total_seconds()
-            if elapsed > 300:  # 5분 이상
+            if elapsed > 300:
                 self.alerter.send_heartbeat_failure("trading-worker", beat_at_str[:19])
         except Exception:
             pass
 
+    def _check_daily_report(self) -> None:
+        """Check for daily report and send Telegram notification."""
+        if not self.alerter:
+            return
+
+        today = datetime.now(KST).date().isoformat()
+        if today in self._sent_daily_report_dates:
+            return
+
+        rows = self._supabase_get("daily_reports", {
+            "report_date": f"eq.{today}",
+            "order": "report_date.desc",
+            "limit": "1",
+        })
+        if not rows:
+            return
+
+        report = rows[0]
+        try:
+            report_data = dict(
+                date=today,
+                daily_pnl=report.get("daily_pnl", 0),
+                trades_count=report.get("trades_count", 0),
+                win_rate=report.get("win_rate", 0),
+                stopped_reason=report.get("stopped_reason", "-"),
+            )
+            self.alerter.send_daily_summary(report_data)
+            self._sent_daily_report_dates.add(today)
+        except Exception:
+            logger.exception("_check_daily_report send failed")
+
     def run(self) -> None:
-        """메인 루프 — 프로세스가 종료될 때까지 실행."""
+        """Main loop."""
         logger.info("AlertWorker started (poll interval: %ds)", POLL_INTERVAL)
         if self.alerter:
             self.alerter.send("🤖 Alert Worker 시작됨")
@@ -253,6 +274,7 @@ class AlertWorker:
                 self._check_new_fills()
                 self._check_emergency_stops()
                 self._check_heartbeat()
+                self._check_daily_report()
             except Exception:
                 logger.exception("AlertWorker loop error")
             time.sleep(POLL_INTERVAL)

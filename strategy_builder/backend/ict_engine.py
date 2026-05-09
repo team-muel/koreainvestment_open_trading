@@ -55,6 +55,13 @@ class ICTConfig:
     max_pending_per_symbol: int = 1
     daily_profit_target_pct: float = 0.005
     force_exit_time: str = "14:50"
+    max_exit_retry: int = 2                   # 시장가 매도 최대 재시도 횟수
+    exit_retry_delay_sec: float = 2.0         # 재시도 대기 시간(초)
+    market_index_filter_pct: float = -0.007   # 지수 -0.7% 이하 진입 금지
+    symbol_cooldown_after_loss: bool = True   # 손절 종목 당일 재진입 금지
+    entry_fee_rate: float = 0.00015           # 매수 수수료율 (0.015%)
+    exit_fee_rate: float = 0.00015            # 매도 수수료율 (0.015%)
+    exit_tax_rate: float = 0.0018             # 증권거래세 (0.18%)
 
 
 @dataclass
@@ -130,15 +137,30 @@ class ICTTradingEngine:
         self._last_total_eval = 0
         self._last_error: str | None = None
         self._last_signal_fingerprint: dict[str, str] = {}
+        self._premarket_ready: bool = False  # 장전 스캔 완료 전까지 주문 금지
+        self._loop_count: int = 0
+        self._symbol_cooldown: dict[str, str] = {}  # symbol → "loss"/"win" (당일 거래 결과)
+        self._today_entry_ids: set[str] = set()      # idempotency: 오늘 진입한 setup_id들
         self.journal = ICTJournal()
 
     def start(self, symbols: list[str]) -> dict[str, Any]:
-        # 실전 모드 이중 잠금 검사
+        # 실전 모드 삼중 잠금
         if LIVE_TRADING_ENABLED:
-            raise RuntimeError(
-                "LIVE_TRADING_ENABLED=True but live trading is not yet supported. "
-                "Set LIVE_TRADING_ENABLED=False for paper trading."
-            )
+            raise RuntimeError("코드 상수 LIVE_TRADING_ENABLED=True — 실계좌 진입 차단")
+
+        import os
+        if os.environ.get("LIVE_TRADING_ENABLED", "false").lower() == "true":
+            raise RuntimeError("환경변수 LIVE_TRADING_ENABLED=true — 실계좌 진입 차단")
+
+        try:
+            from core.supabase_journal import SupabaseJournal
+            _sb = SupabaseJournal()
+            if _sb.enabled and _sb.get_runtime_config("live_trading_enabled", "false").lower() == "true":
+                raise RuntimeError("Supabase runtime_config live_trading_enabled=true — 실계좌 진입 차단")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Supabase 연결 실패는 무시
 
         clean_symbols = [s for s in dict.fromkeys(symbols) if len(s) == 6 and s.isdigit()]
         if not clean_symbols:
@@ -193,6 +215,8 @@ class ICTTradingEngine:
             return {
                 "running": running,
                 "degraded": degraded,
+                "premarket_ready": self._premarket_ready,
+                "engine_state": "ACTIVE" if self._premarket_ready else "PREMARKET_WAIT",
                 "symbols": symbols,
                 "cache": cache_status,
                 "active_setups": active_setups,
@@ -364,12 +388,76 @@ class ICTTradingEngine:
             self._daily_realized,
         )
 
+    def update_symbols(self, symbols: list[str]) -> dict[str, Any]:
+        """장전 스캔 완료 후 감시 종목을 동적으로 업데이트하고 ACTIVE 상태로 전환.
+
+        PREMARKET_WAIT → ACTIVE 전환.
+        이미 ACTIVE 상태여도 종목 목록 갱신 가능.
+        """
+        clean = [s for s in dict.fromkeys(symbols) if len(s) == 6 and s.isdigit()]
+        if not clean:
+            logger.warning("update_symbols: 유효한 종목 없음 — 기존 목록 유지")
+            return self.status()
+
+        with self._lock:
+            old_symbols = list(self._symbols)
+            self._symbols = clean
+            self._premarket_ready = True
+
+        # 새 종목 realtime 구독 추가
+        new_symbols = [s for s in clean if s not in old_symbols]
+        if new_symbols:
+            self.realtime.start(clean)
+
+        logger.info(
+            "update_symbols: PREMARKET_WAIT → ACTIVE | 종목 %s → %s",
+            old_symbols, clean,
+        )
+        self.journal.record_trade_event(
+            "PREMARKET_READY",
+            {"symbol": "ENGINE", "side": "none", "order_no": ""},
+            {"symbols": clean, "previous_symbols": old_symbols},
+        )
+        return self.status()
+
     def _run_loop(self) -> None:
         while True:
             with self._lock:
                 if not self._running:
                     break
                 symbols = list(self._symbols)
+                premarket_ready = self._premarket_ready
+
+            self._loop_count += 1
+
+            # PREMARKET_WAIT 상태: warmup만 실행, 주문/평가 금지
+            if not premarket_ready:
+                now = datetime.now(KST)
+                for symbol in symbols:
+                    try:
+                        self._warmup_today(symbol)
+                        self._collect_current_price(symbol)
+                    except Exception:
+                        logger.exception("warmup error for %s", symbol)
+
+                # 09:10 이후에도 아직 PREMARKET_WAIT이면 자동으로 ACTIVE 전환
+                # (장전 스캔이 실패한 경우 안전망)
+                if now.hour >= 9 and now.minute >= 10:
+                    logger.warning(
+                        "PREMARKET_WAIT 09:10 초과 — 현재 종목으로 자동 ACTIVE 전환: %s",
+                        symbols,
+                    )
+                    with self._lock:
+                        self._premarket_ready = True
+
+                # signal_log 주기적 정리
+                if self._loop_count % 1000 == 0:
+                    self.journal.cleanup_signal_log()
+
+                time.sleep(self.config.loop_interval_seconds)
+                continue
+
+            # ACTIVE 상태: 정상 루프
             for symbol in symbols:
                 try:
                     self._warmup_today(symbol)
@@ -381,6 +469,11 @@ class ICTTradingEngine:
                     with self._lock:
                         self._degraded = True
                         self._last_error = str(e)
+
+            # signal_log 주기적 정리
+            if self._loop_count % 1000 == 0:
+                self.journal.cleanup_signal_log()
+
             time.sleep(self.config.loop_interval_seconds)
 
     def _warmup_today(self, symbol: str) -> None:
@@ -433,22 +526,47 @@ class ICTTradingEngine:
                 return
 
         if not self._market_exception_ok(symbol):
+            self._record_entry_block(setup.to_dict(), "MARKET_EXCEPTION")
             return
         if not self._spread_ok(symbol, setup.trade_plan.entry):
+            self._record_entry_block(setup.to_dict(), "SPREAD_TOO_WIDE")
             return
+
+        # 시장 지수 필터
+        if not self._market_index_ok():
+            self._record_entry_block(setup.to_dict(), "MARKET_INDEX_WEAK")
+            return
+
+        # 종목 cooldown (손절 후 당일 재진입 금지)
+        if self.config.symbol_cooldown_after_loss:
+            with self._lock:
+                cooldown = self._symbol_cooldown.get(symbol)
+            if cooldown == "loss":
+                self._record_entry_block(setup.to_dict(), "SYMBOL_COOLDOWN_AFTER_LOSS")
+                return
+
+        # Idempotency: 같은 setup 중복 진입 방지
+        setup_id = self._build_setup_id(setup.trade_plan)
+        with self._lock:
+            if setup_id in self._today_entry_ids:
+                self._record_entry_block(setup.to_dict(), "DUPLICATE_SETUP_ID")
+                return
+
         quantity = self._calculate_quantity(setup.trade_plan)
         if quantity <= 0:
+            self._record_entry_block(setup.to_dict(), "QUANTITY_ZERO")
             return
         if not self._order_feasible(setup.trade_plan.symbol, setup.trade_plan, quantity):
+            self._record_entry_block(setup.to_dict(), "ORDER_NOT_FEASIBLE")
             return
         self._record_signal_if_changed(setup.to_dict(), action_taken=True)
-        self._submit_entry(setup.trade_plan, quantity)
+        self._submit_entry(setup.trade_plan, quantity, setup_id=setup_id)
 
     def _build_setup_from_1m(self, symbol: str, bars_1m: list[Candle]):
         bars_1d = MinuteBarCache.resample(bars_1m, 390, "1d")
         return self.builder.build_long_setup(symbol, bars_1m, bars_1d)
 
-    def _submit_entry(self, plan: TradePlan, quantity: int) -> None:
+    def _submit_entry(self, plan: TradePlan, quantity: int, setup_id: str = "") -> None:
         signal = Signal(
             stock_code=plan.symbol,
             stock_name=plan.symbol,
@@ -479,6 +597,8 @@ class ICTTradingEngine:
         with self._lock:
             self._pending[plan.symbol] = order
             self._daily_entries += 1
+            if setup_id:
+                self._today_entry_ids.add(setup_id)
         self.journal.record_trade_event("ENTRY_SUBMITTED", order.to_dict(), {"entry_reason": plan.reason})
         self.journal.save_order(order.to_dict())
         self._publish_signal_calendar_event(plan, quantity)
@@ -548,9 +668,13 @@ class ICTTradingEngine:
                 env_dv="vps",
             )
             if fill_result.is_complete:
+                net_pnl = self._calc_net_pnl(fill_result.realized_pnl, fill_result.avg_price or position.entry, position.quantity)
                 with self._lock:
-                    self._daily_realized += fill_result.realized_pnl
-                    self._daily_loss += min(0.0, fill_result.realized_pnl)
+                    self._daily_realized += net_pnl
+                    self._daily_loss += min(0.0, net_pnl)
+                    # 손절/수익 cooldown 기록
+                    if self.config.symbol_cooldown_after_loss:
+                        self._symbol_cooldown[symbol] = "loss" if net_pnl < 0 else "win"
             else:
                 # Fall back to estimated value with warning
                 logger.warning(
@@ -637,26 +761,58 @@ class ICTTradingEngine:
             self._mark_degraded("final take-profit order failed")
 
     def _submit_market_exit(self, order: ManagedOrder, reason: str = "ICT synthetic stop loss") -> None:
-        signal = Signal(
-            stock_code=order.symbol,
-            stock_name=order.symbol,
-            action=Action.SELL,
-            strength=1.0,
-            reason=reason,
-            quantity=order.quantity,
-        )
-        result = OrderExecutor(env_dv="vps").execute_signal(signal)
-        if not result.empty:
-            row = result.iloc[0]
+        """시장가 손절/강제청산. 실제 보유수량 기준, 실패 시 재시도."""
+        # broker 실잔고 기준 (TP 부분체결로 잔여수량이 달라질 수 있음)
+        holdings, holdings_ok = data_fetcher.get_holdings_checked("vps")
+        actual_qty = 0
+        if holdings_ok and not holdings.empty and "stock_code" in holdings.columns:
+            matched = holdings[holdings["stock_code"] == order.symbol]
+            if not matched.empty:
+                actual_qty = int(matched.iloc[0].get("quantity", 0))
+
+        if actual_qty <= 0:
+            logger.warning("_submit_market_exit: %s 보유수량 0 — 이미 청산됨", order.symbol)
             with self._lock:
-                order.status = TradeState.EXITING
-                order.exit_order_no = str(row.get("ODNO", ""))
-                order.exit_org_no = str(row.get("KRX_FWDG_ORD_ORGNO", ""))
-            self.journal.record_trade_event("EXIT_SUBMITTED", order.to_dict(), {"exit_reason": reason})
-        else:
-            self._emergency_stop("market exit submission failed")
+                self._positions.pop(order.symbol, None)
+            return
+
+        for attempt in range(self.config.max_exit_retry + 1):
+            signal = Signal(
+                stock_code=order.symbol,
+                stock_name=order.symbol,
+                action=Action.SELL,
+                strength=1.0,
+                reason=reason,
+                quantity=actual_qty,
+            )
+            result = OrderExecutor(env_dv="vps").execute_signal(signal)
+            if not result.empty:
+                row = result.iloc[0]
+                with self._lock:
+                    order.status = TradeState.EXITING
+                    order.exit_order_no = str(row.get("ODNO", ""))
+                    order.exit_org_no = str(row.get("KRX_FWDG_ORD_ORGNO", ""))
+                    self._daily_loss += max(0.0, (order.entry - order.stop) * actual_qty)
+                self.journal.record_trade_event("EXIT_SUBMITTED", order.to_dict(), {"exit_reason": reason, "actual_qty": actual_qty})
+                return
+
+            if attempt < self.config.max_exit_retry:
+                logger.warning("시장가 매도 실패 %s (시도 %d/%d) — %.1fs 후 재시도",
+                    order.symbol, attempt + 1, self.config.max_exit_retry, self.config.exit_retry_delay_sec)
+                time.sleep(self.config.exit_retry_delay_sec)
+                # 재조회: 아직 보유 중인지
+                h2, ok2 = data_fetcher.get_holdings_checked("vps")
+                if ok2 and not h2.empty and "stock_code" in h2.columns:
+                    m2 = h2[h2["stock_code"] == order.symbol]
+                    actual_qty = int(m2.iloc[0].get("quantity", 0)) if not m2.empty else 0
+                if actual_qty <= 0:
+                    logger.info("재시도 전 %s 이미 청산 확인", order.symbol)
+                    return
+
+        self._emergency_stop(f"시장가 매도 {self.config.max_exit_retry + 1}회 실패: {order.symbol}")
 
     def _cancel_take_profit_orders(self, position: ManagedOrder) -> bool:
+        """TP 주문 취소 후 실제로 미체결 목록에서 사라졌는지 재확인."""
         targets = [
             (position.tp_order_no, position.tp_org_no),
             (position.tp2_order_no, position.tp2_org_no),
@@ -665,22 +821,25 @@ class ICTTradingEngine:
             if not order_no:
                 continue
             if not self._cancel_order(
-                position,
-                "vps",
-                order_no=order_no,
-                org_no=org_no,
+                position, "vps",
+                order_no=order_no, org_no=org_no,
                 remove_pending=False,
             ):
                 self._emergency_stop("take-profit cancel failed before exit")
                 return False
+
+        # 취소 요청 성공만으로 부족 — 재조회로 실제 사라졌는지 확인
+        time.sleep(self.config.exit_retry_delay_sec)
         pending_orders, pending_ok = data_fetcher.get_pending_orders("vps")
         if not pending_ok:
-            self._mark_degraded("take-profit cancel status could not be verified before exit")
+            self._emergency_stop("take-profit cancel status could not be verified before exit")
             return False
         for order_no, _org_no in targets:
             if order_no and self._order_still_pending(order_no, pending_orders):
                 self._emergency_stop("take-profit remains pending after cancel response")
                 return False
+        return True
+
         return True
 
     def _cancel_order(
@@ -978,73 +1137,56 @@ class ICTTradingEngine:
             "ticker": plan.symbol,
             "title": "Buy submitted",
             "description": (
-                f"Setup: {plan.reason}\n"
-                f"Entry: {plan.entry:,.0f}\n"
-                f"Stop: {plan.stop:,.0f}\n"
-                f"Target: {plan.take_profit:,.0f}\n"
-                f"Quantity: {quantity}\n"
+                "Setup: " + plan.reason + "\n"
+                "Entry: " + f"{plan.entry:,.0f}" + "\n"
+                "Stop: " + f"{plan.stop:,.0f}" + "\n"
+                "Target: " + f"{plan.take_profit:,.0f}" + "\n"
+                "Quantity: " + str(quantity) + "\n"
                 "Action: monitor fill, TP, VWAP reclaim failure, and force-exit rules."
             ),
             "event_dt": datetime.now(KST),
         })
 
-    @staticmethod
-    def _pending_snapshot(order: ManagedOrder, pending_orders: pd.DataFrame) -> dict[str, int] | None:
-        if pending_orders.empty or "order_no" not in pending_orders.columns:
-            return None
-        matched = pending_orders[pending_orders["order_no"].astype(str) == str(order.order_no)]
-        if matched.empty:
-            return None
-        row = matched.iloc[0]
-        order_qty = int(row.get("order_qty", order.quantity) or order.quantity)
-        filled_quantity = int(row.get("filled_qty", 0) or 0)
-        unfilled_quantity = int(row.get("unfilled_qty", max(order_qty - filled_quantity, 0)) or 0)
-        return {
-            "order_quantity": order_qty,
-            "filled_quantity": filled_quantity,
-            "unfilled_quantity": unfilled_quantity,
-        }
 
-    @staticmethod
-    def _order_still_pending(order_no: str, pending_orders: pd.DataFrame) -> bool:
-        if not order_no or pending_orders.empty or "order_no" not in pending_orders.columns:
-            return False
-        matched = pending_orders[pending_orders["order_no"].astype(str) == str(order_no)]
-        if matched.empty:
-            return False
-        if "unfilled_qty" not in matched.columns:
-            return True
-        return int(matched.iloc[0].get("unfilled_qty", 0) or 0) > 0
 
-    @staticmethod
-    def _df_to_candles(symbol: str, df: pd.DataFrame) -> list[Candle]:
-        bars: list[Candle] = []
-        for _, row in df.iterrows():
-            ts = row["timestamp"]
-            if hasattr(ts, "to_pydatetime"):
-                ts = ts.to_pydatetime()
-            bars.append(Candle(
-                timestamp=ts,
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=int(row.get("volume", 0)),
-                symbol=symbol,
-                timeframe="1m",
-            ))
-        return bars
+    def _build_setup_id(self, plan: TradePlan) -> str:
+        """주문 idempotency key: 날짜+종목+방향+진입가."""
+        today = datetime.now(KST).strftime("%Y%m%d")
+        return f"{today}-{plan.symbol}-{plan.side.upper()}-{int(plan.entry)}"
 
-    @staticmethod
-    def _candle_to_dict(bar: Candle) -> dict[str, Any]:
-        return {
-            "time": bar.timestamp.isoformat(),
-            "open": bar.open,
-            "high": bar.high,
-            "low": bar.low,
-            "close": bar.close,
-            "volume": bar.volume,
-        }
+    def _market_index_ok(self) -> bool:
+        """KOSPI 당일 등락률이 임계값 이상인지 확인. 조회 실패 시 True(허용)."""
+        try:
+            kospi = data_fetcher.get_current_price("0001", "vps")
+            change_rate = float(kospi.get("change_rate", 0) or 0)
+            if change_rate <= self.config.market_index_filter_pct:
+                logger.info("시장 지수 필터: KOSPI %+.2f%% → 신규 진입 금지", change_rate * 100)
+                return False
+        except Exception:
+            pass
+        return True
 
+    def _record_entry_block(self, setup: dict, reason: str) -> None:
+        """진입 차단 사유를 journal에 기록."""
+        symbol = str(setup.get("symbol") or "")
+        if not symbol:
+            return
+        logger.info("진입 차단: %s — %s", symbol, reason)
+        try:
+            self.journal.record_signal(
+                {**setup, "entry_block_reason": reason},
+                action_taken=False,
+                reason_not_taken=reason,
+            )
+        except Exception:
+            pass
+
+    def _calc_net_pnl(self, gross_pnl: float, avg_price: float, qty: int) -> float:
+        """수수료 + 세금 차감 후 실현손익 계산."""
+        if qty <= 0 or avg_price <= 0:
+            return gross_pnl
+        fees = avg_price * qty * (self.config.entry_fee_rate + self.config.exit_fee_rate)
+        tax = avg_price * qty * self.config.exit_tax_rate
+        return gross_pnl - fees - tax
 
 ict_engine = ICTTradingEngine()

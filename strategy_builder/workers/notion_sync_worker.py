@@ -25,13 +25,13 @@ import requests
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
-SYNC_INTERVAL = 15  # 초
+SYNC_INTERVAL = 15
 NOTION_VERSION = "2022-06-28"
 BATCH_SIZE = 10
 
 
 class NotionSyncClient:
-    """Notion API 클라이언트."""
+    """Notion API client."""
 
     def __init__(self, token: str):
         self.session = requests.Session()
@@ -73,7 +73,7 @@ class NotionSyncClient:
 
 
 class SupabasePoller:
-    """Supabase에서 미동기화 row를 polling."""
+    """Supabase polling client."""
 
     def __init__(self, url: str, key: str):
         self.base = url.rstrip("/") + "/rest/v1"
@@ -83,7 +83,6 @@ class SupabasePoller:
         }
 
     def get_unsynced_trades(self, limit: int = BATCH_SIZE) -> list[dict]:
-        """notion_synced=false 인 trade_journal 조회."""
         try:
             resp = requests.get(
                 f"{self.base}/trade_journal",
@@ -101,7 +100,6 @@ class SupabasePoller:
             return []
 
     def get_unsynced_daily_reports(self, limit: int = 5) -> list[dict]:
-        """notion_synced_at is null 인 daily_reports 조회."""
         try:
             resp = requests.get(
                 f"{self.base}/daily_reports",
@@ -164,7 +162,6 @@ class SupabasePoller:
 
 
 def _trade_to_notion_properties(trade: dict) -> dict:
-    """trade_journal row -> Notion 속성."""
     event = trade.get("event", "")
     ticker = trade.get("ticker", "")
     side_emoji = "🟢" if trade.get("side") == "buy" else "🔴"
@@ -232,8 +229,38 @@ def _daily_report_to_notion_properties(report: dict) -> dict:
     return props
 
 
+def _premarket_to_notion_properties(scan: dict) -> dict:
+    ticker = scan.get("ticker", "")
+    name = scan.get("name", "")
+    priority = scan.get("priority", 0) or 0
+    emoji = "🔴" if priority >= 8 else "🟡" if priority >= 5 else "🟢"
+    title = f"[{priority}] {ticker} {name}"
+
+    props: dict[str, Any] = {
+        "Name": {"title": [{"text": {"content": title[:200]}}]},
+        "Date": {"date": {"start": scan.get("scan_date") or datetime.now(KST).date().isoformat()}},
+        "Ticker": {"rich_text": [{"text": {"content": ticker}}]},
+        "Market": {"select": {"name": scan.get("market", "KOSPI")[:50]}},
+        "Priority": {"number": int(priority)},
+        "Status": {"select": {"name": scan.get("status", "WATCHLIST")[:50]}},
+    }
+
+    if scan.get("prev_change_pct") is not None:
+        props["PrevChangePct"] = {"number": float(scan["prev_change_pct"])}
+    if scan.get("relative_volume") is not None:
+        props["RelativeVolume"] = {"number": float(scan["relative_volume"])}
+    if scan.get("liquidity_level"):
+        props["LiquidityLevel"] = {"select": {"name": str(scan["liquidity_level"])[:50]}}
+    if scan.get("ict_setup"):
+        props["ICTSetup"] = {"rich_text": [{"text": {"content": str(scan["ict_setup"])[:2000]}}]}
+    if scan.get("scan_reason"):
+        props["ScanReason"] = {"rich_text": [{"text": {"content": str(scan["scan_reason"])[:2000]}}]}
+
+    return props
+
+
 class NotionSyncWorker:
-    """메인 sync worker."""
+    """Main sync worker."""
 
     def __init__(self):
         token = os.environ.get("NOTION_TOKEN", "").strip()
@@ -254,6 +281,10 @@ class NotionSyncWorker:
         else:
             logger.warning("NotionSyncWorker: SUPABASE_URL/KEY not set -> disabled")
             self.poller = None
+
+        self._sync_log: dict[str, set[str]] = {
+            "premarket": set(),
+        }
 
     def _sync_trades(self) -> int:
         if not self.notion or not self.poller or not self.trade_db_id:
@@ -286,6 +317,27 @@ class NotionSyncWorker:
                 logger.exception("Notion daily report sync failed for %s", report.get("report_date"))
         return synced
 
+    def _sync_premarket(self) -> int:
+        """Sync today's pre-market scans to Notion."""
+        if not self.notion or not self.poller or not self.premarket_db_id:
+            return 0
+
+        scans = self.poller.get_today_premarket()
+        synced = 0
+        for scan in scans:
+            try:
+                scan_key = f"{scan.get('scan_date', '')}:{scan.get('ticker', '')}"
+                if scan_key in self._sync_log["premarket"]:
+                    continue
+
+                props = _premarket_to_notion_properties(scan)
+                self.notion.create_page(self.premarket_db_id, props)
+                self._sync_log["premarket"].add(scan_key)
+                synced += 1
+            except Exception:
+                logger.exception("Notion premarket sync failed for %s", scan.get("ticker"))
+        return synced
+
     def run(self) -> None:
         logger.info("NotionSyncWorker started (interval: %ds)", SYNC_INTERVAL)
         loop = 0
@@ -294,8 +346,9 @@ class NotionSyncWorker:
             try:
                 trades_synced = self._sync_trades()
                 reports_synced = self._sync_daily_reports()
-                if trades_synced or reports_synced:
-                    logger.info("Notion sync: %d trades, %d reports", trades_synced, reports_synced)
+                premarket_synced = self._sync_premarket()
+                if trades_synced or reports_synced or premarket_synced:
+                    logger.info("Notion sync: %d trades, %d reports, %d premarket", trades_synced, reports_synced, premarket_synced)
             except Exception:
                 logger.exception("NotionSyncWorker loop error")
             time.sleep(SYNC_INTERVAL)

@@ -330,6 +330,25 @@ class ICTJournal:
                 return None
             return dict(row)
 
+    def record_strategy_change(
+        self,
+        changed_rule: str,
+        before_value: str,
+        after_value: str,
+        reason: str,
+        expected_effect: str = "",
+        review_date: str = "",
+    ) -> None:
+        """전략 변경 로그 기록."""
+        self._execute(
+            """insert into strategy_change_log (
+                created_at, changed_rule, before_value, after_value,
+                reason, expected_effect, review_date
+            ) values (?, ?, ?, ?, ?, ?, ?)""",
+            (datetime.now().isoformat(), changed_rule, before_value,
+             after_value, reason, expected_effect, review_date),
+        )
+
     def cleanup_signal_log(self, max_rows: int = 10000, keep_days: int = 30) -> int:
         """signal_log 보관량 제한.
 
@@ -518,11 +537,21 @@ class ICTJournal:
                 """
             )
 
-    def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(sql, params)
-            conn.commit()
+    def _execute(self, sql: str, params: tuple | None = None) -> None:
+        """Execute SQL (write only)."""
+        try:
+            with sqlite3.connect(self.path) as conn:
+                if params:
+                    conn.execute(sql, params)
+                else:
+                    conn.execute(sql)
+                conn.commit()
+        except Exception as e:
+            pass
 
-    @staticmethod
-    def _json(payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False, default=str)
+    def _json(self, obj: Any) -> str:
+        """Serialize to JSON."""
+        try:
+            return json.dumps(obj, default=str, ensure_ascii=False)
+        except Exception:
+            return "{}"

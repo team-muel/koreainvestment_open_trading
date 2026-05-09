@@ -451,6 +451,128 @@ class SupabaseJournal:
         except Exception:
             pass  # heartbeat 실패는 무시
 
-    # ICTJournal 호환용 no-op stubs (SQLite 전용 메서드)
+    def record_strategy_change(
+        self,
+        changed_rule: str,
+        before_value: str,
+        after_value: str,
+        reason: str,
+        expected_effect: str = "",
+        review_date: str = "",
+    ) -> None:
+        """전략 변경 로그 기록."""
+        if not self._client:
+            return
+        try:
+            self._client.insert("strategy_change_log", {
+                "created_at": datetime.now(KST).isoformat(),
+                "changed_rule": changed_rule,
+                "before_value": before_value,
+                "after_value": after_value,
+                "reason": reason,
+                "expected_effect": expected_effect,
+                "review_date": review_date,
+            })
+        except Exception:
+            logger.exception("SupabaseJournal.record_strategy_change failed")
+
+    # ── job_runs: 워크플로 멱등성 보장 ──────────────────────────
+
+    def start_job(self, job_name: str, trade_date: str) -> bool:
+        """워크플로 시작 기록. 이미 SUCCESS면 False 반환 (중복 실행 방지)."""
+        if not self._client:
+            return True  # no-op 모드에서는 항상 실행 허용
+        try:
+            # 이미 SUCCESS인지 확인
+            rows = self._client.select(
+                "job_runs",
+                filters={"job_name": f"eq.{job_name}", "trade_date": f"eq.{trade_date}", "status": "eq.SUCCESS"},
+                limit=1,
+            )
+            if rows:
+                logger.info("job_runs: %s %s already SUCCESS — skip", job_name, trade_date)
+                return False
+            # RUNNING으로 upsert
+            self._client.upsert("job_runs", {
+                "job_name": job_name,
+                "trade_date": trade_date,
+                "status": "RUNNING",
+                "started_at": datetime.now(KST).isoformat(),
+                "finished_at": None,
+                "error_message": None,
+            }, on_conflict="job_name,trade_date")
+            return True
+        except Exception:
+            logger.exception("start_job failed")
+            return True  # 실패 시 실행 허용 (안전한 방향)
+
+    def finish_job(self, job_name: str, trade_date: str, success: bool, error: str = "", payload: dict | None = None) -> None:
+        """워크플로 완료 기록."""
+        if not self._client:
+            return
+        try:
+            self._client.upsert("job_runs", {
+                "job_name": job_name,
+                "trade_date": trade_date,
+                "status": "SUCCESS" if success else "FAILED",
+                "finished_at": datetime.now(KST).isoformat(),
+                "error_message": error[:500] if error else None,
+                "payload": payload or {},
+            }, on_conflict="job_name,trade_date")
+        except Exception:
+            logger.exception("finish_job failed")
+
+    def get_job_status(self, job_name: str, trade_date: str) -> str:
+        """워크플로 상태 조회. 없으면 'NOT_RUN' 반환."""
+        if not self._client:
+            return "NOT_RUN"
+        try:
+            rows = self._client.select(
+                "job_runs",
+                filters={"job_name": f"eq.{job_name}", "trade_date": f"eq.{trade_date}"},
+                limit=1,
+            )
+            return rows[0]["status"] if rows else "NOT_RUN"
+        except Exception:
+            return "NOT_RUN"
+
+    # ── watchlists: 장전 스캔 종목 영속화 ──────────────────────
+
+    def save_watchlist(self, trade_date: str, symbols: list[dict]) -> None:
+        """장전 스캔 watchlist를 Supabase에 저장 (VM 재시작 시에도 유지)."""
+        if not self._client or not symbols:
+            return
+        try:
+            for item in symbols:
+                self._client.upsert("watchlists", {
+                    "trade_date": trade_date,
+                    "symbol": item.get("code") or item.get("symbol", ""),
+                    "name": item.get("name", ""),
+                    "priority": item.get("priority"),
+                    "scan_reason": item.get("scan_reason", ""),
+                    "status": "ACTIVE",
+                    "payload": item,
+                }, on_conflict="trade_date,symbol")
+            logger.info("save_watchlist: %d종목 저장 (%s)", len(symbols), trade_date)
+        except Exception:
+            logger.exception("save_watchlist failed")
+
+    def load_watchlist(self, trade_date: str) -> list[str]:
+        """오늘 watchlist 종목코드 목록 반환."""
+        if not self._client:
+            return []
+        try:
+            rows = self._client.select(
+                "watchlists",
+                filters={"trade_date": f"eq.{trade_date}", "status": "eq.ACTIVE"},
+                limit=30,
+                order="priority.asc",
+            )
+            return [r["symbol"] for r in rows if r.get("symbol")]
+        except Exception:
+            logger.exception("load_watchlist failed")
+            return []
+
+    # ICTJournal 호환용 no-op stub
     def cleanup_signal_log(self, max_rows: int = 10000, keep_days: int = 30) -> int:
-        return 0  # Supabase에서는 별도 정책으로 관리
+        return 0

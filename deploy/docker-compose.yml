@@ -85,6 +85,25 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ── 5. Daily Report Worker ──────────────────────────────
+  daily-report-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: kis-daily-report
+    restart: unless-stopped
+    command: python -m strategy_builder.workers.daily_report_worker
+    env_file: .env
+    volumes:
+      - /opt/kis-config:/home/kisbot/KIS/config
+    networks:
+      - kis-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   kis-net:
     driver: bridge
