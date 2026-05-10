@@ -64,7 +64,7 @@ class IntradayReclaimTests(unittest.TestCase):
         self.assertIsNone(setup.trade_plan)
         self.assertTrue(any("sweep depth below threshold" in note for note in setup.notes))
 
-    def test_rejects_setup_when_stop_width_is_too_large(self):
+    def test_fixed_stop_caps_wide_structural_stop(self):
         bars = []
         for minute in range(15):
             bars.append(bar(minute, 10000, 10050, 9950, 10000, 1000))
@@ -78,8 +78,10 @@ class IntradayReclaimTests(unittest.TestCase):
 
         setup = IntradayLiquidityReclaimBuilder().build_long_setup("005930", bars, [])
 
-        self.assertIsNone(setup.trade_plan)
-        self.assertTrue(any("stop width too large" in note for note in setup.notes))
+        self.assertIsNotNone(setup.trade_plan)
+        risk_pct = (setup.trade_plan.entry - setup.trade_plan.stop) / setup.trade_plan.entry
+        self.assertLessEqual(risk_pct, 0.006)
+        self.assertAlmostEqual(setup.trade_plan.stop, setup.trade_plan.entry * 0.995)
 
 
 if __name__ == "__main__":

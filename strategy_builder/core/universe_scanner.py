@@ -41,7 +41,7 @@ from typing import Any
 from ict_core import ICTSetup, IntradayLiquidityReclaimBuilder
 
 from . import data_fetcher
-from .ict_cache import MinuteBarCache
+from .ict_cache import MinuteBarCache, build_minute_bar_cache
 from .symbol_master import SymbolInfo, SymbolMaster
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,7 @@ class KRXUniverseScanner:
         builder: IntradayLiquidityReclaimBuilder | None = None,
     ):
         self.master = master or SymbolMaster()
-        self.cache = cache or MinuteBarCache()
+        self.cache = cache or build_minute_bar_cache()
         self.builder = builder or IntradayLiquidityReclaimBuilder()
 
     def collect_master(self) -> dict:
@@ -249,6 +249,7 @@ class KRXUniverseScanner:
         )
         return {
             "universe_count": len(symbols),
+            "eligible_name_count": len(filtered_symbols),
             "scanned_count": scanned,
             "candidate_count": len(candidates),
             "scored_count": len(scored),

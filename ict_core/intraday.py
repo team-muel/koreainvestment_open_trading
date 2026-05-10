@@ -257,7 +257,12 @@ class IntradayLiquidityReclaimBuilder:
         vwap_stop = vwap_values[-1] - tick
         structural_stop = sweep_low - (tick * 2)
         fixed_stop = entry * (1 - self.config.fixed_stop_pct)
-        stop = min(structural_stop, vwap_stop, fixed_stop)
+        valid_stops = [
+            candidate
+            for candidate in (structural_stop, vwap_stop, fixed_stop)
+            if 0 < candidate < entry
+        ]
+        stop = max(valid_stops) if valid_stops else 0.0
         risk = entry - stop
         details["execution"].update({
             "entry_candidate": entry,
@@ -410,8 +415,13 @@ class IntradayLiquidityReclaimBuilder:
         if len(sorted_keys) < 2:
             return False
 
-        # 현재 진행 중인 버킷(마지막)은 제외, 그 직전 완성된 5분봉 사용
-        last_complete_key = sorted_keys[-2]
+        last_key = sorted_keys[-1]
+        last_bucket = buckets[last_key]
+        last_bar = last_bucket[-1][0]
+        last_bucket_complete = len(last_bucket) >= 5 and last_bar.timestamp.minute % 5 == 4
+
+        # 마지막 버킷이 5개 1분봉으로 완성됐으면 그것을 쓰고, 아니면 직전 완성 버킷을 쓴다.
+        last_complete_key = last_key if last_bucket_complete else sorted_keys[-2]
         complete_bars = buckets[last_complete_key]
 
         # 5분봉 종가 = 버킷 내 마지막 1분봉의 close

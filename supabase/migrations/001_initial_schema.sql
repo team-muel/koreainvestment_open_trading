@@ -216,5 +216,74 @@ CREATE TABLE IF NOT EXISTS trade_journal (
 CREATE INDEX IF NOT EXISTS idx_trade_journal_ticker ON trade_journal(ticker);
 CREATE INDEX IF NOT EXISTS idx_trade_journal_notion_synced ON trade_journal(notion_synced);
 
+-- 12. strategy_change_log: rule-change audit trail
+CREATE TABLE IF NOT EXISTS strategy_change_log (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    changed_rule TEXT NOT NULL,
+    before_value TEXT,
+    after_value TEXT,
+    reason TEXT,
+    expected_effect TEXT,
+    review_date TEXT,
+    result TEXT,
+    keep_or_revert TEXT,
+    payload JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_change_created_at ON strategy_change_log(created_at DESC);
+
+-- 13. job_runs: idempotency and status for scheduled workers
+CREATE TABLE IF NOT EXISTS job_runs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_name TEXT NOT NULL,
+    trade_date DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'RUNNING',
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    error_message TEXT,
+    payload JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(job_name, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_name_date ON job_runs(job_name, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_job_runs_status ON job_runs(status);
+
+-- 14. watchlists: selected symbols from the pre-market scan
+CREATE TABLE IF NOT EXISTS watchlists (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trade_date DATE NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    priority INTEGER,
+    scan_reason TEXT,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    payload JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(trade_date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlists_trade_date ON watchlists(trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_watchlists_status ON watchlists(status);
+
+-- 15. agent_runs: AI/automation agent audit trail
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_name TEXT NOT NULL,
+    trade_date DATE NOT NULL,
+    input_payload JSONB,
+    output_payload JSONB,
+    status TEXT NOT NULL DEFAULT 'SUCCESS',
+    llm_model TEXT,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(agent_name, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_name_date ON agent_runs(agent_name, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
+
 -- Row Level Security (선택적) - 필요시 활성화
 -- ALTER TABLE orders ENABLE ROW LEVEL SECURITY;

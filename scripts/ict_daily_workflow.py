@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "strategy_builder"))
 
 import kis_auth as ka  # noqa: E402
 from strategy_builder.core import data_fetcher  # noqa: E402
-from strategy_builder.core.ict_cache import MinuteBarCache  # noqa: E402
+from strategy_builder.core.ict_cache import build_minute_bar_cache  # noqa: E402
 from strategy_builder.core.ict_journal import ICTJournal  # noqa: E402
 from strategy_builder.core.gcal_reporter import publish_gcal_event_if_configured  # noqa: E402
 from strategy_builder.core.notion_reporter import publish_daily_report_if_configured  # noqa: E402
@@ -34,6 +34,17 @@ from strategy_builder.core.universe_scanner import KRXUniverseScanner, UniverseF
 
 REPORT_ROOT = ROOT / "strategy_builder" / "data" / "reports" / "ict"
 LATEST_WATCHLIST = REPORT_ROOT / "latest_watchlist.json"
+
+
+def _build_journal():
+    try:
+        from strategy_builder.core.supabase_journal import SupabaseJournal
+        journal = SupabaseJournal()
+        if journal.enabled:
+            return journal
+    except Exception:
+        pass
+    return ICTJournal()
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,7 +115,7 @@ def run_premarket_scan(args: argparse.Namespace) -> int:
     _write_json(json_path, result)
     _write_json(LATEST_WATCHLIST, result)
     _write_text(md_path, _premarket_markdown(result))
-    journal = ICTJournal()
+    journal = _build_journal()
     for item in result.get("watchlist", []):
         journal.record_premarket_candidate(item, stamp)
     notion_page = _publish_notion(
@@ -160,7 +171,7 @@ def run_postmarket_feedback(args: argparse.Namespace) -> int:
     watchlist_data = json.loads(watchlist_path.read_text(encoding="utf-8"))
     watchlist = watchlist_data.get("watchlist", [])[: args.limit]
     symbols = [item["code"] for item in watchlist if item.get("code")]
-    cache = MinuteBarCache()
+    cache = build_minute_bar_cache()
     scanner = KRXUniverseScanner(cache=cache)
     cached_setups = scanner.scan_cached_ict_setups(symbols, limit=args.limit)
 
@@ -203,7 +214,7 @@ def run_postmarket_feedback(args: argparse.Namespace) -> int:
     md_path = REPORT_ROOT / f"{stamp}_postmarket_feedback.md"
     _write_json(json_path, result)
     _write_text(md_path, _postmarket_markdown(result))
-    ICTJournal().record_daily_report({
+    _build_journal().record_daily_report({
         "date": stamp,
         "workflow": "postmarket-feedback",
         "summary": {

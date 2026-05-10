@@ -50,10 +50,10 @@ def main() -> None:
         sys.exit(1)
 
     # 엔진 초기화
-    from core.ict_cache import MinuteBarCache
+    from core.ict_cache import build_minute_bar_cache
     from backend.ict_engine import ICTTradingEngine, ICTConfig
 
-    cache = MinuteBarCache()
+    cache = build_minute_bar_cache()
     config = ICTConfig()
     engine = ICTTradingEngine(cache=cache, config=config)
 

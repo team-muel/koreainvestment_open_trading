@@ -17,7 +17,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "strategy_builder"))
 
 from strategy_builder.backend.ict_engine import ICTTradingEngine  # noqa: E402
-from strategy_builder.core.ict_cache import MinuteBarCache  # noqa: E402
+from strategy_builder.core.ict_cache import MinuteBarCache, build_minute_bar_cache  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     symbols = [item.strip() for item in args.symbols.split(",") if item.strip()]
-    cache = MinuteBarCache(args.db) if args.db else MinuteBarCache()
+    cache = MinuteBarCache(args.db) if args.db else build_minute_bar_cache()
     engine = ICTTradingEngine(cache=cache)
     result = engine.backtest_from_cache(symbols, args.start, args.end)
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, "strategy_builder"))
 import kis_auth as ka  # noqa: E402
 from ict_core import Candle  # noqa: E402
 from strategy_builder.core import data_fetcher  # noqa: E402
-from strategy_builder.core.ict_cache import MinuteBarCache  # noqa: E402
+from strategy_builder.core.ict_cache import MinuteBarCache, build_minute_bar_cache  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,7 +68,7 @@ def main() -> int:
         raise SystemExit("--symbols must include at least one symbol")
 
     ka.auth(svr=args.mode)
-    cache = MinuteBarCache(args.db) if args.db else MinuteBarCache()
+    cache = MinuteBarCache(args.db) if args.db else build_minute_bar_cache()
     dates = _iter_dates(args.days)
     summary: dict[str, dict[str, int]] = {}
 

@@ -822,6 +822,73 @@ def get_pending_orders(env_dv: str = "real") -> tuple[pd.DataFrame, bool]:
 # 주문 취소
 # =============================================================================
 
+def get_order_fills(env_dv: str = "real") -> tuple[pd.DataFrame, bool]:
+    """Return today's order and fill records without filtering to unfilled orders only."""
+    if not _assert_trenv_ready("체결내역 조회"):
+        return pd.DataFrame(), False
+
+    try:
+        trenv = ka.getTREnv()
+        is_real = env_dv in ("real", "prod")
+        tr_id = "TTTC8001R" if is_real else "VTTC8001R"
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO": trenv.my_acct,
+            "ACNT_PRDT_CD": trenv.my_prod,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        res = ka._url_fetch(
+            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            tr_id, "", params
+        )
+        if not res.isOK():
+            logging.warning("체결내역 조회 실패")
+            return pd.DataFrame(), False
+
+        df = pd.DataFrame(res.getBody().output1)
+        if df.empty:
+            return pd.DataFrame(), True
+
+        df = df.rename(columns={
+            "odno": "order_no",
+            "ord_orgno": "org_no",
+            "pdno": "stock_code",
+            "prdt_name": "stock_name",
+            "sll_buy_dvsn_cd_name": "order_type",
+            "ord_qty": "order_qty",
+            "ord_unpr": "order_price",
+            "tot_ccld_qty": "filled_qty",
+            "avg_prvs": "avg_price",
+            "avg_ccld_prc": "avg_price",
+            "rmn_qty": "unfilled_qty",
+            "ord_tmd": "order_time",
+        })
+        columns = [
+            "order_no", "org_no", "stock_code", "stock_name", "order_type",
+            "order_qty", "order_price", "filled_qty", "avg_price",
+            "unfilled_qty", "order_time",
+        ]
+        df = df[[col for col in columns if col in df.columns]]
+        for col in ["order_qty", "order_price", "filled_qty", "avg_price", "unfilled_qty"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        return df.reset_index(drop=True), True
+    except Exception as e:
+        logging.error(f"체결내역 조회 오류: {e}")
+        return pd.DataFrame(), False
+
+
 def cancel_order(
     order_no: str,
     stock_code: str,
@@ -899,4 +966,24 @@ def cancel_order(
             "order_no": order_no,
             "message": str(e)
         }
+
+
+def get_current_price_checked(stock_code: str, env_dv: str = "real") -> tuple[dict, bool]:
+    data = get_current_price(stock_code, env_dv)
+    return data, bool(data and float(data.get("price", 0) or 0) > 0)
+
+
+def get_buyable_amount_checked(stock_code: str, price: int, env_dv: str = "real") -> tuple[dict, bool]:
+    data = get_buyable_amount(stock_code, price, env_dv)
+    return data, bool(data and ("quantity" in data or "amount" in data))
+
+
+def get_deposit_checked(env_dv: str = "real") -> tuple[dict, bool]:
+    data = get_deposit(env_dv)
+    return data, bool(data and (data.get("total_eval") or data.get("deposit")))
+
+
+def get_orderbook_checked(stock_code: str, env_dv: str = "real") -> tuple[dict, bool]:
+    data = get_orderbook(stock_code, env_dv)
+    return data, bool(data and data.get("ask_prices") and data.get("bid_prices"))
 

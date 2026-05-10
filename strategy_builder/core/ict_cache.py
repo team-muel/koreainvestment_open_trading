@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from ict_core import Candle
+
+logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
 
 
 class MinuteBarCache:
@@ -228,3 +234,182 @@ class MinuteBarCache:
                 timeframe=timeframe,
             ))
         return result
+
+
+class SupabaseMinuteBarCache:
+    """Supabase-backed minute bar cache with the same public API as MinuteBarCache."""
+
+    MIN_READY_BARS_PER_DAY = MinuteBarCache.MIN_READY_BARS_PER_DAY
+
+    def __init__(self):
+        from .supabase_journal import SupabaseClient
+
+        url = os.environ.get("SUPABASE_URL", "").strip()
+        key = (
+            os.environ.get("SUPABASE_KEY", "").strip()
+            or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+            or os.environ.get("SUPABASE_ANON_KEY", "").strip()
+        )
+        if not url or not key:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_KEY are required for SupabaseMinuteBarCache")
+        self._client = SupabaseClient(url, key)
+
+    def upsert_bars(self, symbol: str, bars: Iterable[Candle]) -> int:
+        rows = [
+            {
+                "symbol": symbol,
+                "ts": self._format_ts(bar.timestamp),
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+                "source": "backfill",
+            }
+            for bar in bars
+        ]
+        if not rows:
+            return 0
+        self._client.upsert("bars_1m", rows, on_conflict="symbol,ts")
+        return len(rows)
+
+    def upsert_tick_as_minute(
+        self,
+        symbol: str,
+        timestamp: datetime,
+        price: float,
+        volume: int = 0,
+        source: str = "realtime",
+    ) -> None:
+        ts = self._format_ts(timestamp)
+        existing = self._client.select(
+            "bars_1m",
+            filters={"symbol": f"eq.{symbol}", "ts": f"eq.{ts}"},
+            limit=1,
+        )
+        if not existing:
+            self._client.upsert("bars_1m", {
+                "symbol": symbol,
+                "ts": ts,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": volume,
+                "source": source,
+            }, on_conflict="symbol,ts")
+            return
+
+        row = existing[0]
+        current_source = row.get("source") or source
+        next_source = source if current_source == "poll" else current_source
+        next_row = {
+            "symbol": symbol,
+            "ts": ts,
+            "open": float(row.get("open") or price),
+            "high": max(float(row.get("high") or price), price),
+            "low": min(float(row.get("low") or price), price),
+            "close": price,
+            "volume": int(row.get("volume") or 0) + int(volume or 0),
+            "source": next_source,
+        }
+        self._client.upsert("bars_1m", next_row, on_conflict="symbol,ts")
+
+    def get_1m_bars(self, symbol: str, limit: int | None = None) -> list[Candle]:
+        query_limit = int(limit) if limit else 20000
+        order = "ts.desc" if limit else "ts.asc"
+        rows = self._client.select(
+            "bars_1m",
+            filters={"symbol": f"eq.{symbol}"},
+            limit=query_limit,
+            order=order,
+        )
+        if limit:
+            rows = list(reversed(rows))
+        return [
+            Candle(
+                timestamp=self._parse_ts(row.get("ts")),
+                open=float(row.get("open") or 0),
+                high=float(row.get("high") or 0),
+                low=float(row.get("low") or 0),
+                close=float(row.get("close") or 0),
+                volume=int(row.get("volume") or 0),
+                symbol=symbol,
+                timeframe="1m",
+            )
+            for row in rows
+            if row.get("ts")
+        ]
+
+    def coverage_days(self, symbol: str) -> int:
+        return len({self._trade_date(row) for row in self._coverage_rows(symbol) if row.get("ts")})
+
+    def ready_coverage_days(self, symbol: str, min_bars_per_day: int | None = None) -> int:
+        return len(self.ready_dates(symbol, min_bars_per_day))
+
+    def ready_dates(self, symbol: str, min_bars_per_day: int | None = None) -> set[str]:
+        minimum = min_bars_per_day or self.MIN_READY_BARS_PER_DAY
+        counts: dict[str, int] = {}
+        for row in self._coverage_rows(symbol):
+            if (row.get("source") or "") not in {"backfill", "realtime"}:
+                continue
+            trade_date = self._trade_date(row)
+            counts[trade_date] = counts.get(trade_date, 0) + 1
+        return {trade_date for trade_date, count in counts.items() if count >= minimum}
+
+    def coverage_summary(self, symbol: str) -> dict:
+        return {
+            "coverage_days": self.coverage_days(symbol),
+            "ready_coverage_days": self.ready_coverage_days(symbol),
+            "min_bars_per_ready_day": self.MIN_READY_BARS_PER_DAY,
+            "backend": "supabase",
+        }
+
+    @staticmethod
+    def resample(bars: list[Candle], interval_minutes: int, timeframe: str) -> list[Candle]:
+        return MinuteBarCache.resample(bars, interval_minutes, timeframe)
+
+    def _coverage_rows(self, symbol: str) -> list[dict]:
+        return self._client.select(
+            "bars_1m",
+            filters={"symbol": f"eq.{symbol}"},
+            limit=20000,
+            order="ts.desc",
+        )
+
+    @staticmethod
+    def _parse_ts(value: str) -> datetime:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed
+        return parsed.astimezone(KST).replace(tzinfo=None)
+
+    @staticmethod
+    def _format_ts(value: datetime) -> str:
+        timestamp = value.replace(second=0, microsecond=0)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=KST)
+        else:
+            timestamp = timestamp.astimezone(KST)
+        return timestamp.isoformat()
+
+    @classmethod
+    def _trade_date(cls, row: dict) -> str:
+        return cls._parse_ts(str(row.get("ts"))).date().isoformat()
+
+
+def build_minute_bar_cache(db_path: str | Path | None = None):
+    backend = os.environ.get("ICT_CACHE_BACKEND", "").strip().lower()
+    use_supabase = backend == "supabase" or (
+        backend not in {"sqlite", "local"} and os.environ.get("SUPABASE_URL") and (
+            os.environ.get("SUPABASE_KEY")
+            or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            or os.environ.get("SUPABASE_ANON_KEY")
+        )
+    )
+    if use_supabase:
+        try:
+            return SupabaseMinuteBarCache()
+        except Exception:
+            logger.exception("Supabase minute-bar cache initialization failed; falling back to SQLite")
+    return MinuteBarCache(db_path)

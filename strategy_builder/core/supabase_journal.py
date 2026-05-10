@@ -104,7 +104,11 @@ class SupabaseJournal:
 
     def __post_init__(self) -> None:
         url = os.environ.get("SUPABASE_URL", "").strip()
-        key = os.environ.get("SUPABASE_KEY", "").strip()
+        key = (
+            os.environ.get("SUPABASE_KEY", "").strip()
+            or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+            or os.environ.get("SUPABASE_ANON_KEY", "").strip()
+        )
         if url and key:
             self._client = SupabaseClient(url, key)
             logger.info("SupabaseJournal initialized: %s", url)

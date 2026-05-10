@@ -43,18 +43,21 @@ class UniverseScannerTests(unittest.TestCase):
 
             def daily_prices(symbol, days, env_dv):
                 if symbol == "005930":
-                    close, volume = 80000, 100000
+                    close, volume = 80000, 300000
                 elif symbol == "000660":
-                    close, volume = 170000, 200000
+                    close, volume = 170000, 500000
                 else:
                     close, volume = 10000, 1000
+                prev_close = close * 0.995
+                prev_low = close / 1.015
+                prev_high = close * 1.04
                 return pd.DataFrame({
                     "date": [f"202601{i:02d}" for i in range(1, 22)],
-                    "open": [close] * 21,
-                    "high": [close] * 21,
-                    "low": [close] * 21,
-                    "close": [close] * 21,
-                    "volume": [volume] * 21,
+                    "open": [prev_close] * 20 + [close],
+                    "high": [prev_high] * 20 + [close * 1.01],
+                    "low": [prev_low] * 20 + [close * 0.995],
+                    "close": [prev_close] * 20 + [close],
+                    "volume": [max(1, volume // 5)] * 20 + [volume],
                 })
 
             with patch("strategy_builder.core.universe_scanner.data_fetcher.get_daily_prices", side_effect=daily_prices):

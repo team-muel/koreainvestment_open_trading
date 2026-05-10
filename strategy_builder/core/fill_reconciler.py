@@ -61,22 +61,26 @@ class FillReconciler:
         realized_pnl = 0.0
         is_complete = False
 
-        # Try to get pending orders to check fill status
-        pending_orders, pending_ok = data_fetcher.get_pending_orders(env_dv)
-
-        if pending_ok and not pending_orders.empty and "order_no" in pending_orders.columns:
-            matched = pending_orders[pending_orders["order_no"].astype(str) == str(order_no)]
+        fills, fills_ok = data_fetcher.get_order_fills(env_dv)
+        if fills_ok and not fills.empty and "order_no" in fills.columns:
+            matched = fills[fills["order_no"].astype(str) == str(order_no)]
             if not matched.empty:
                 row = matched.iloc[0]
                 filled_qty = int(row.get("filled_qty", 0) or 0)
-                # Calculate average price if available from API
-                if filled_qty > 0:
-                    avg_price = float(row.get("avg_price", entry_price) or entry_price)
-            else:
-                # Order not in pending list - assume fully filled
-                filled_qty = quantity
-                avg_price = entry_price
-                is_complete = True
+                avg_price = float(row.get("avg_price", 0) or 0)
+                if avg_price <= 0 and filled_qty > 0:
+                    avg_price = float(row.get("order_price", 0) or 0)
+                is_complete = filled_qty >= quantity and quantity > 0 and avg_price > 0
+
+        if not is_complete:
+            pending_orders, pending_ok = data_fetcher.get_pending_orders(env_dv)
+            if pending_ok and not pending_orders.empty and "order_no" in pending_orders.columns:
+                matched = pending_orders[pending_orders["order_no"].astype(str) == str(order_no)]
+                if not matched.empty:
+                    row = matched.iloc[0]
+                    filled_qty = max(filled_qty, int(row.get("filled_qty", 0) or 0))
+                    if avg_price <= 0 and filled_qty > 0:
+                        avg_price = float(row.get("avg_price", 0) or row.get("order_price", 0) or 0)
 
         # Calculate realized P&L based on side
         if filled_qty > 0:

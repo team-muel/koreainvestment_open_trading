@@ -25,7 +25,7 @@ from ict_core import Candle, ICTReplayBacktester, IntradayLiquidityReclaimBuilde
 from ict_core.builder import krx_tick_size
 
 from core import data_fetcher
-from core.ict_cache import MinuteBarCache
+from core.ict_cache import MinuteBarCache, build_minute_bar_cache
 from core.ict_journal import ICTJournal
 from core.gcal_reporter import publish_gcal_signal_if_configured
 from core.ict_realtime import RealtimeTickCollector
@@ -115,11 +115,12 @@ class ManagedOrder:
 
 class ICTTradingEngine:
     def __init__(self, cache: MinuteBarCache | None = None, config: ICTConfig | None = None):
-        self.cache = cache or MinuteBarCache()
+        self.cache = cache or build_minute_bar_cache()
         self.realtime = RealtimeTickCollector(self.cache, env_dv="vps")
         self.config = config or ICTConfig()
         self.builder = IntradayLiquidityReclaimBuilder()
-        self.fill_reconciler = FillReconciler()
+        self.journal = self._build_journal()
+        self.fill_reconciler = FillReconciler(self.journal)
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._notif_thread: threading.Thread | None = None
@@ -141,7 +142,17 @@ class ICTTradingEngine:
         self._loop_count: int = 0
         self._symbol_cooldown: dict[str, str] = {}  # symbol → "loss"/"win" (당일 거래 결과)
         self._today_entry_ids: set[str] = set()      # idempotency: 오늘 진입한 setup_id들
-        self.journal = ICTJournal()
+
+    @staticmethod
+    def _build_journal():
+        try:
+            from core.supabase_journal import SupabaseJournal
+            journal = SupabaseJournal()
+            if journal.enabled:
+                return journal
+        except Exception:
+            logger.exception("Supabase journal initialization failed; falling back to SQLite journal")
+        return ICTJournal()
 
     def start(self, symbols: list[str]) -> dict[str, Any]:
         # 실전 모드 삼중 잠금
@@ -688,20 +699,16 @@ class ICTTradingEngine:
                 net_pnl = self._calc_net_pnl(fill_result.realized_pnl, fill_result.avg_price or position.entry, position.quantity)
                 with self._lock:
                     self._daily_realized += net_pnl
-                    self._daily_loss += min(0.0, net_pnl)
+                    if net_pnl < 0:
+                        self._daily_loss += abs(net_pnl)
                     # 손절/수익 cooldown 기록
                     if self.config.symbol_cooldown_after_loss:
                         self._symbol_cooldown[symbol] = "loss" if net_pnl < 0 else "win"
             else:
-                # Fall back to estimated value with warning
                 logger.warning(
-                    "FillReconciler incomplete for %s, using estimated exit value",
+                    "FillReconciler incomplete for %s; closing position state without estimated PnL",
                     position.symbol,
                 )
-                estimated_exit = position.take_profit if position.take_profit > 0 else position.entry
-                estimated_pnl = (estimated_exit - position.entry) * position.quantity
-                with self._lock:
-                    self._daily_realized += estimated_pnl
             with self._lock:
                 self._positions.pop(symbol, None)
             self.journal.record_trade_event(
@@ -809,7 +816,6 @@ class ICTTradingEngine:
                     order.status = TradeState.EXITING
                     order.exit_order_no = str(row.get("ODNO", ""))
                     order.exit_org_no = str(row.get("KRX_FWDG_ORD_ORGNO", ""))
-                    self._daily_loss += max(0.0, (order.entry - order.stop) * actual_qty)
                 self.journal.record_trade_event("EXIT_SUBMITTED", order.to_dict(), {"exit_reason": reason, "actual_qty": actual_qty})
                 return
 
@@ -886,6 +892,46 @@ class ICTTradingEngine:
                 self._pending.pop(order.symbol, None)
         return True
 
+    @staticmethod
+    def _pending_snapshot(order: ManagedOrder, pending_orders: pd.DataFrame) -> dict[str, int] | None:
+        """Return broker-side filled/unfilled quantities for a pending order."""
+        if pending_orders is None or pending_orders.empty or "order_no" not in pending_orders.columns:
+            return None
+
+        matched = pending_orders[pending_orders["order_no"].astype(str) == str(order.order_no)]
+        if matched.empty:
+            return None
+
+        row = matched.iloc[0]
+
+        def as_int(value: Any, default: int = 0) -> int:
+            try:
+                if pd.isna(value):
+                    return default
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+        order_qty = as_int(row.get("order_qty"), order.quantity)
+        filled_qty = as_int(row.get("filled_qty"), 0)
+        unfilled_qty = as_int(row.get("unfilled_qty"), max(order_qty - filled_qty, 0))
+        if order_qty <= 0:
+            order_qty = max(order.quantity, filled_qty + unfilled_qty)
+        if unfilled_qty < 0:
+            unfilled_qty = max(order_qty - filled_qty, 0)
+
+        return {
+            "order_quantity": order_qty,
+            "filled_quantity": max(filled_qty, 0),
+            "unfilled_quantity": max(unfilled_qty, 0),
+        }
+
+    @staticmethod
+    def _order_still_pending(order_no: str, pending_orders: pd.DataFrame) -> bool:
+        if pending_orders is None or pending_orders.empty or "order_no" not in pending_orders.columns:
+            return False
+        return not pending_orders[pending_orders["order_no"].astype(str) == str(order_no)].empty
+
     def _cancel_pending_entry(self, order: ManagedOrder, env_dv: str) -> None:
         pending_orders, pending_ok = data_fetcher.get_pending_orders(env_dv)
         holdings, holdings_ok = data_fetcher.get_holdings_checked(env_dv)
@@ -944,13 +990,13 @@ class ICTTradingEngine:
 
         orderbook = data_fetcher.get_orderbook(symbol, "vps")
         if not orderbook:
-            return True  # 호가 정보 없으면 통과 (보수적으로 허용)
+            return False
 
         ask_prices = orderbook.get("ask_prices") or []
         ask_volumes = orderbook.get("ask_volumes") or []
 
         if not ask_prices or not ask_volumes:
-            return True
+            return False
 
         # 1차 호가 잔량 대비 주문 수량 비율
         best_ask_volume = int(ask_volumes[0]) if ask_volumes else 0

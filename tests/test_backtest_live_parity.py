@@ -129,7 +129,7 @@ class TestBacktestLiveParity(unittest.TestCase):
         """P1-6: spread 필터가 tick cap AND % cap 동시 만족을 요구해야 한다."""
         # 이 테스트는 _spread_ok 로직 검증 (mock 없이 로직만 테스트)
         from ict_core.builder import krx_tick_size
-        entry = 10000.0
+        entry = 20000.0
         tick = krx_tick_size(entry)
         tick_cap = tick * 3
         pct_cap = entry * 0.003
