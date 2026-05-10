@@ -29,8 +29,17 @@ class FillResult:
 class FillReconciler:
     """Reconciles order fills from KIS API and persists to journal."""
 
-    def __init__(self, journal: ICTJournal | None = None):
+    def __init__(
+        self,
+        journal: ICTJournal | None = None,
+        entry_fee_rate: float = 0.00015,
+        exit_fee_rate: float = 0.00015,
+        exit_tax_rate: float = 0.0018,
+    ):
         self.journal = journal or ICTJournal()
+        self.entry_fee_rate = entry_fee_rate
+        self.exit_fee_rate = exit_fee_rate
+        self.exit_tax_rate = exit_tax_rate
 
     def reconcile(
         self,
@@ -40,6 +49,7 @@ class FillReconciler:
         quantity: int,
         entry_price: float,
         env_dv: str = "vps",
+        stop_price: float | None = None,
     ) -> FillResult:
         """
         Reconcile a closed position using KIS API and calculate actual P&L.
@@ -65,11 +75,15 @@ class FillReconciler:
         if fills_ok and not fills.empty and "order_no" in fills.columns:
             matched = fills[fills["order_no"].astype(str) == str(order_no)]
             if not matched.empty:
-                row = matched.iloc[0]
-                filled_qty = int(row.get("filled_qty", 0) or 0)
-                avg_price = float(row.get("avg_price", 0) or 0)
-                if avg_price <= 0 and filled_qty > 0:
-                    avg_price = float(row.get("order_price", 0) or 0)
+                total_value = 0.0
+                for _, row in matched.iterrows():
+                    row_qty = int(row.get("filled_qty", 0) or 0)
+                    row_price = float(row.get("avg_price", 0) or row.get("order_price", 0) or 0)
+                    if row_qty <= 0 or row_price <= 0:
+                        continue
+                    filled_qty += row_qty
+                    total_value += row_qty * row_price
+                avg_price = total_value / filled_qty if filled_qty > 0 else 0.0
                 is_complete = filled_qty >= quantity and quantity > 0 and avg_price > 0
 
         if not is_complete:
@@ -91,8 +105,11 @@ class FillReconciler:
                 # For buy, P&L would be calculated on exit
                 realized_pnl = 0.0
 
-            # Estimate fees (approximately 0.1% - 0.15% typical for Korean brokers)
-            fees = avg_price * filled_qty * 0.001
+            turnover = avg_price * filled_qty
+            if side == "sell":
+                fees = turnover * (self.exit_fee_rate + self.exit_tax_rate)
+            else:
+                fees = turnover * self.entry_fee_rate
 
         # Save fill record to journal
         fill_data = {
@@ -101,6 +118,7 @@ class FillReconciler:
             "side": side,
             "filled_qty": filled_qty,
             "avg_price": avg_price,
+            "risk_amount": abs(entry_price - stop_price) * quantity if stop_price is not None else None,
             "fees": fees,
             "realized_pnl": realized_pnl,
             "fill_time": datetime.now(KST).isoformat(),

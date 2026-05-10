@@ -175,7 +175,13 @@ watchlist 전체 요약도 포함하세요.
         logger.info("LLM 분석 중 (종목 %d개, 모델: %s)...", len(candidates), self.llm.model)
 
         try:
-            result, usage = self.llm.complete_json(SYSTEM_PROMPT, prompt, max_tokens=3000)
+            result, usage = self.llm.complete_json(
+                SYSTEM_PROMPT,
+                prompt,
+                max_tokens=3000,
+                required_keys=["watchlist_summary", "candidates", "telegram_briefing"],
+                fallback=self._fallback_analysis(candidates),
+            )
             logger.info("LLM 완료 — 토큰: 입력 %d / 출력 %d",
                         usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
             return result

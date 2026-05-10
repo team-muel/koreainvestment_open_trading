@@ -59,6 +59,36 @@ class ICTEngineTests(unittest.TestCase):
             self.assertEqual(cache.coverage_days("005930"), 20)
             self.assertEqual(cache.ready_coverage_days("005930"), 0)
 
+    def test_krx_session_daily_resample_groups_by_trade_date(self):
+        bars = [
+            Candle(timestamp=datetime(2026, 5, 7, 8, 59), open=1, high=999, low=1, close=1, volume=1, symbol="005930", timeframe="1m"),
+            Candle(timestamp=datetime(2026, 5, 7, 9, 0), open=100, high=101, low=99, close=100, volume=10, symbol="005930", timeframe="1m"),
+            Candle(timestamp=datetime(2026, 5, 7, 15, 30), open=100, high=110, low=98, close=105, volume=20, symbol="005930", timeframe="1m"),
+            Candle(timestamp=datetime(2026, 5, 8, 9, 0), open=106, high=108, low=104, close=107, volume=30, symbol="005930", timeframe="1m"),
+        ]
+
+        daily = MinuteBarCache.resample_krx_session_daily(bars)
+
+        self.assertEqual(len(daily), 2)
+        self.assertEqual(daily[0].timestamp, datetime(2026, 5, 7, 15, 30))
+        self.assertEqual(daily[0].open, 100)
+        self.assertEqual(daily[0].high, 110)
+        self.assertEqual(daily[0].low, 98)
+        self.assertEqual(daily[0].close, 105)
+
+    def test_update_symbols_preserves_managed_symbols(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        engine = ICTTradingEngine(cache=MinuteBarCache(os.path.join(tmp.name, "bars.sqlite3")))
+        engine._symbols = ["005930", "000660"]
+        engine._pending["005930"] = ManagedOrder(symbol="005930", side="buy", order_no="1", quantity=1)
+        engine._positions["000660"] = ManagedOrder(symbol="000660", side="buy", order_no="2", quantity=1)
+
+        with patch.object(engine.realtime, "start"):
+            engine.update_symbols(["035720"])
+
+        self.assertEqual(engine._symbols, ["035720", "005930", "000660"])
+
     def test_tp_fill_removes_closed_position(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

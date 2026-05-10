@@ -35,6 +35,8 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(root, "deploy", ".env"))
 
 from strategy_builder.agents.llm_client import LLMClient
+from strategy_builder.agents.tool_registry import build_agent_tool_registry
+from strategy_builder.core.supabase_journal import SupabaseJournal
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -71,103 +73,19 @@ class AuditAgent:
         self.notion_daily_db = os.environ.get("NOTION_DAILY_REPORT_DB_ID", "").strip()
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        self.tool_registry = build_agent_tool_registry(audit_sink=SupabaseJournal())
 
-    def _sb_get(self, table: str, params: dict | None = None) -> list[dict]:
-        if not self.supabase_url:
-            return []
-        try:
-            resp = requests.get(
-                f"{self.supabase_url}/rest/v1/{table}",
-                headers={"apikey": self.supabase_key, "Authorization": f"Bearer {self.supabase_key}",
-                         "Prefer": "return=representation"},
-                params=params or {}, timeout=15,
-            )
-            return resp.json() if resp.ok else []
-        except Exception:
-            return []
-
-    def _sb_upsert(self, table: str, data: dict, on_conflict: str = "") -> bool:
-        if not self.supabase_url:
-            return False
-        try:
-            params = {}
-            if on_conflict:
-                params["on_conflict"] = on_conflict
-            resp = requests.post(
-                f"{self.supabase_url}/rest/v1/{table}",
-                headers={"apikey": self.supabase_key, "Authorization": f"Bearer {self.supabase_key}",
-                         "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
-                json=[data], params=params, timeout=15,
-            )
-            return resp.ok
-        except Exception:
-            return False
+    # Supabase access for this agent goes through AgentToolRegistry.
 
     # ── 데이터 수집 ───────────────────────────────────────────
 
     def fetch_day_events(self, trade_date: str) -> dict[str, Any]:
         """하루의 모든 이벤트 수집."""
-        date_start = f"{trade_date}T00:00:00+09:00"
-        date_end = f"{trade_date}T23:59:59+09:00"
-
-        # 시그널 (진입 성공 + 차단 모두)
-        signals = self._sb_get("signals", {
-            "created_at": f"gte.{date_start}",
-            "order": "created_at.asc",
-            "limit": "100",
-        })
-
-        # 주문 내역
-        orders = self._sb_get("orders", {
-            "submitted_at": f"gte.{date_start}",
-            "order": "submitted_at.asc",
-            "limit": "50",
-        })
-
-        # 실체결
-        fills = self._sb_get("fills", {
-            "fill_time": f"gte.{date_start}",
-            "order": "fill_time.asc",
-            "limit": "50",
-        })
-
-        # agent_runs (리스크 리뷰 포함)
-        agent_runs = self._sb_get("agent_runs", {
-            "trade_date": f"eq.{trade_date}",
-            "order": "created_at.asc",
-            "limit": "20",
-        })
-
-        # 엔진 heartbeat (이상 징후 체크)
-        heartbeats = self._sb_get("engine_heartbeats", {
-            "beat_at": f"gte.{date_start}",
-            "order": "beat_at.asc",
-            "limit": "50",
-        })
-
-        # trade_journal (POSITION_CLOSED, EMERGENCY_STOP 등)
-        journal = self._sb_get("trade_journal", {
-            "created_at": f"gte.{date_start}",
-            "order": "created_at.asc",
-            "limit": "50",
-        })
-
-        # 일일 리포트
-        daily_report = self._sb_get("daily_reports", {
-            "report_date": f"eq.{trade_date}",
-            "limit": "1",
-        })
-
-        return {
-            "trade_date": trade_date,
-            "signals": signals,
-            "orders": orders,
-            "fills": fills,
-            "agent_runs": agent_runs,
-            "heartbeats": heartbeats,
-            "journal": journal,
-            "daily_report": daily_report[0] if daily_report else {},
-        }
+        return self.tool_registry.call(
+            "audit_agent",
+            "get_audit_context",
+            trade_date=trade_date,
+        )
 
     # ── 타임라인 재구성 ───────────────────────────────────────
 
@@ -376,7 +294,13 @@ class AuditAgent:
 
         try:
             prompt = self.build_audit_prompt(events, timeline, anomalies)
-            result, usage = self.llm.complete_json(SYSTEM_PROMPT, prompt, max_tokens=2500)
+            result, usage = self.llm.complete_json(
+                SYSTEM_PROMPT,
+                prompt,
+                max_tokens=2500,
+                required_keys=["audit_summary", "decision_trail", "anomaly_analysis", "telegram_alert"],
+                fallback=self._fallback_audit(events, timeline, anomalies),
+            )
             logger.info("AuditAgent LLM 완료 — 토큰: %s", usage)
             return result
         except Exception:
@@ -529,19 +453,21 @@ class AuditAgent:
         self.send_alert_if_needed(audit)
 
         # 7. agent_runs 기록
-        self._sb_upsert("agent_runs", {
-            "agent_name": "audit_agent",
-            "trade_date": trade_date,
-            "input_payload": {"events_count": len(timeline), "anomalies_count": len(anomalies)},
-            "output_payload": {
+        self.tool_registry.call(
+            "audit_agent",
+            "save_agent_run",
+            agent_name="audit_agent",
+            trade_date=trade_date,
+            input_payload={"events_count": len(timeline), "anomalies_count": len(anomalies)},
+            output_payload={
                 "summary": audit.get("audit_summary", "")[:300],
                 "system_health": audit.get("system_health", "NORMAL"),
                 "has_violations": bool(audit.get("rule_compliance", {}).get("violations")),
                 "anomalies": [a["description"][:100] for a in anomalies],
             },
-            "status": "SUCCESS",
-            "llm_model": self.llm.model,
-        }, on_conflict="agent_name,trade_date")
+            status="SUCCESS",
+            llm_model=self.llm.model,
+        )
 
         logger.info("=== Audit Agent 완료 ===")
         return {

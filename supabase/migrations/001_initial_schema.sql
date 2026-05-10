@@ -36,10 +36,12 @@ CREATE TABLE IF NOT EXISTS fills (
     avg_price NUMERIC(12,2),
     fees NUMERIC(12,4) DEFAULT 0,
     realized_pnl NUMERIC(14,2),
+    risk_amount NUMERIC(14,2),
     is_complete BOOLEAN DEFAULT FALSE,
     fill_time TIMESTAMPTZ DEFAULT NOW(),
     payload JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(order_no, side)
 );
 CREATE INDEX IF NOT EXISTS idx_fills_order_no ON fills(order_no);
 CREATE INDEX IF NOT EXISTS idx_fills_symbol ON fills(symbol);
@@ -284,6 +286,34 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_runs_name_date ON agent_runs(agent_name, trade_date DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
+
+-- 16. agent_tool_calls: MCP-like internal tool call audit trail
+CREATE TABLE IF NOT EXISTS agent_tool_calls (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_name TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    input_payload JSONB,
+    output_payload JSONB,
+    status TEXT NOT NULL DEFAULT 'SUCCESS',
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_agent_created ON agent_tool_calls(agent_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_tool_created ON agent_tool_calls(tool_name, created_at DESC);
+
+-- 17. audit_events: normalized audit observations
+CREATE TABLE IF NOT EXISTS audit_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trade_date DATE NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'INFO',
+    event_type TEXT NOT NULL,
+    ticker TEXT,
+    description TEXT,
+    payload JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_trade_date ON audit_events(trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_severity ON audit_events(severity);
 
 -- Row Level Security (선택적) - 필요시 활성화
 -- ALTER TABLE orders ENABLE ROW LEVEL SECURITY;

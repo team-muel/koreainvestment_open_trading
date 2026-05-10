@@ -293,19 +293,25 @@ class KRXUniverseScanner:
         if df.empty or len(df) < 5:
             return None
 
-        last = df.iloc[-1]
-        last_close = float(last["close"])
-        last_volume = int(last["volume"])
+        prev_day = df.iloc[-1]
+        day_before = df.iloc[-2] if len(df) >= 2 else prev_day
+
+        last_close = float(prev_day["close"])
+        last_volume = int(prev_day["volume"])
         last_trading_value = last_close * last_volume
         avg_trading_value = float((df["close"] * df["volume"]).tail(20).mean())
         avg_volume = float(df["volume"].tail(20).mean())
         relative_volume = last_volume / avg_volume if avg_volume > 0 else 0.0
 
-        prev_row = df.iloc[-2] if len(df) >= 2 else last
-        prev_close = float(prev_row["close"])
-        prev_high = float(prev_row["high"])
-        prev_low = float(prev_row["low"])
-        prev_change_pct = (last_close - prev_close) / prev_close if prev_close > 0 else 0.0
+        prev_close = float(prev_day["close"])
+        prev_high = float(prev_day["high"])
+        prev_low = float(prev_day["low"])
+        day_before_close = float(day_before["close"])
+        prev_change_pct = (
+            (prev_close - day_before_close) / day_before_close
+            if day_before_close > 0
+            else 0.0
+        )
 
         recent_highs = df["high"].tail(5).tolist() if "high" in df.columns else []
         recent_lows = df["low"].tail(5).tolist() if "low" in df.columns else []
@@ -645,7 +651,7 @@ class KRXUniverseScanner:
         bars_1m = self.cache.get_1m_bars(symbol)
         if len(bars_1m) < 300:
             return None
-        bars_1d = self.cache.resample(bars_1m, 390, "1d")
+        bars_1d = self.cache.resample_krx_session_daily(bars_1m)
         return self.builder.build_long_setup(symbol, bars_1m, bars_1d)
 
     @staticmethod

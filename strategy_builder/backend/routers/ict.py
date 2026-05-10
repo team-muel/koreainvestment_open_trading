@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from backend import get_current_mode, is_authenticated
 from backend.ict_engine import ict_engine
+from core import data_fetcher
 from core.universe_scanner import KRXUniverseScanner, UniverseFilterConfig
 
 logger = logging.getLogger(__name__)
@@ -155,9 +156,11 @@ def _run_premarket_workflow() -> dict:
     logger.info("Premarket scan workflow started: %s", scan_date)
     try:
         result = universe_scanner.scan(config=UniverseFilterConfig(), env_dv="vps")
+        premarket_list = result.get("premarket_list", [])
         watchlist = result.get("watchlist", [])
+        engine_symbols = result.get("engine_symbols") or result.get("symbols_for_ict_start") or []
 
-        for item in watchlist:
+        for item in premarket_list:
             try:
                 journal.record_premarket_candidate(item, scan_date)
             except Exception:
@@ -176,7 +179,7 @@ def _run_premarket_workflow() -> dict:
             logger.exception("GCal premarket event creation failed")
 
         # runtime_config watch_symbols 업데이트
-        top_symbols = [item["code"] for item in watchlist[:5]] if watchlist else []
+        top_symbols = [str(code) for code in engine_symbols[:5] if str(code).isdigit()]
         if top_symbols and journal.enabled:
             journal.set_runtime_config("watch_symbols", ",".join(top_symbols))
 
@@ -192,9 +195,14 @@ def _run_premarket_workflow() -> dict:
             except Exception:
                 logger.exception("ict_engine.update_symbols 호출 실패")
         else:
-            logger.warning("장전 스캔 결과 없음 — 엔진 PREMARKET_WAIT 유지 (09:10에 자동 전환)")
+            logger.warning("장전 스캔 결과 없음 — 엔진 PREMARKET_WAIT 유지, 신규 진입 차단")
 
-        payload = {"scan_date": scan_date, "watchlist_count": len(watchlist), "symbols": top_symbols}
+        payload = {
+            "scan_date": scan_date,
+            "premarket_count": len(premarket_list),
+            "watchlist_count": len(watchlist),
+            "symbols": top_symbols,
+        }
         journal.finish_job("premarket", scan_date, success=True, payload=payload)
 
         # Pre-market Reason Agent 비동기 실행 (LLM 근거 작성 + Notion 업데이트)
@@ -228,7 +236,7 @@ def _run_postmarket_workflow() -> dict:
 
     try:
         from workers.daily_report_worker import DailyReportWorker
-        result = DailyReportWorker().run_once()
+        result = DailyReportWorker().run_once(run_agents=True)
         journal.finish_job("postmarket", today, success=True, payload=result)
         return {"status": "success", **result}
     except Exception as e:
@@ -238,25 +246,29 @@ def _run_postmarket_workflow() -> dict:
 
 
 @router.post("/workflow/premarket")
-async def run_premarket_workflow(background_tasks: BackgroundTasks):
+async def run_premarket_workflow(background_tasks: BackgroundTasks, sync: bool = False):
     """Trigger premarket scan workflow."""
     now = datetime.now(KST)
     if now.weekday() >= 5:
         return {"status": "skipped", "reason": "weekend"}
     if not (6 <= now.hour < 10):
         return {"status": "skipped", "reason": f"outside premarket hours ({now.strftime('%H:%M')} KST)"}
+    if sync:
+        return _run_premarket_workflow()
     background_tasks.add_task(_run_premarket_workflow)
     return {"status": "accepted", "message": "premarket scan in background", "time": now.isoformat()}
 
 
 @router.post("/workflow/postmarket")
-async def run_postmarket_workflow(background_tasks: BackgroundTasks):
+async def run_postmarket_workflow(background_tasks: BackgroundTasks, sync: bool = False):
     """Trigger postmarket report workflow."""
     now = datetime.now(KST)
     if now.weekday() >= 5:
         return {"status": "skipped", "reason": "weekend"}
     if now.hour < 15 or (now.hour == 15 and now.minute < 30):
         return {"status": "skipped", "reason": f"outside postmarket hours ({now.strftime('%H:%M')} KST)"}
+    if sync:
+        return _run_postmarket_workflow()
     background_tasks.add_task(_run_postmarket_workflow)
     return {"status": "accepted", "message": "postmarket report in background", "time": now.isoformat()}
 
@@ -309,6 +321,44 @@ async def shutdown_check():
             issues.append(f"엔진 degraded: {status.get('last_error', '')}")
     except Exception as e:
         warnings.append(f"엔진 상태 확인 실패: {e}")
+
+    try:
+        holdings, holdings_ok = data_fetcher.get_holdings_checked("vps")
+        if not holdings_ok:
+            issues.append("KIS 보유종목 조회 실패")
+        elif not holdings.empty:
+            broker_positions = holdings.to_dict("records")
+            if broker_positions:
+                issues.append(
+                    f"KIS 실제 보유 {len(broker_positions)}개: "
+                    f"{[p.get('stock_code') for p in broker_positions[:10]]}"
+                )
+    except Exception as e:
+        issues.append(f"KIS 보유종목 확인 실패: {e}")
+
+    try:
+        broker_pending, pending_ok = data_fetcher.get_pending_orders("vps")
+        if not pending_ok:
+            issues.append("KIS 미체결 조회 실패")
+        elif not broker_pending.empty:
+            issues.append(f"KIS 실제 미체결 주문 {len(broker_pending)}건 존재")
+    except Exception as e:
+        issues.append(f"KIS 미체결 확인 실패: {e}")
+
+    try:
+        if journal.enabled and journal._client:
+            open_positions = journal._client.select("positions", limit=10)
+            open_orders = journal._client.select(
+                "orders",
+                filters={"status": "in.(LIMIT_SUBMITTED,ENTERED,EXITING)"},
+                limit=10,
+            )
+            if open_positions:
+                issues.append(f"Supabase positions {len(open_positions)}건 존재")
+            if open_orders:
+                issues.append(f"Supabase open orders {len(open_orders)}건 존재")
+    except Exception as e:
+        warnings.append(f"Supabase 상태 확인 실패: {e}")
 
     report_status = journal.get_job_status("postmarket", today)
     if report_status == "RUNNING":

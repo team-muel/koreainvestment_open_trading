@@ -15,7 +15,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -412,22 +412,27 @@ class ICTTradingEngine:
 
         with self._lock:
             old_symbols = list(self._symbols)
-            self._symbols = clean
+            protected = set(self._pending.keys()) | set(self._positions.keys())
+            merged = list(dict.fromkeys(clean + [s for s in old_symbols if s in protected] + list(protected)))
+            removed = [s for s in old_symbols if s not in merged]
+            self._symbols = merged
             self._premarket_ready = True
+            for symbol in removed:
+                self._setups.pop(symbol, None)
 
         # 새 종목 realtime 구독 추가
-        new_symbols = [s for s in clean if s not in old_symbols]
+        new_symbols = [s for s in merged if s not in old_symbols]
         if new_symbols:
-            self.realtime.start(clean)
+            self.realtime.start(merged)
 
         logger.info(
             "update_symbols: PREMARKET_WAIT → ACTIVE | 종목 %s → %s",
-            old_symbols, clean,
+            old_symbols, merged,
         )
         self.journal.record_trade_event(
             "PREMARKET_READY",
             {"symbol": "ENGINE", "side": "none", "order_no": ""},
-            {"symbols": clean, "previous_symbols": old_symbols},
+            {"symbols": merged, "previous_symbols": old_symbols, "protected_symbols": sorted(protected)},
         )
         return self.status()
 
@@ -441,25 +446,25 @@ class ICTTradingEngine:
 
             self._loop_count += 1
 
-            # PREMARKET_WAIT 상태: warmup만 실행, 주문/평가 금지
+            # PREMARKET_WAIT 상태: warmup과 기존 주문/포지션 관리만 실행, 신규 진입 금지
             if not premarket_ready:
                 now = datetime.now(KST)
                 for symbol in symbols:
                     try:
                         self._warmup_today(symbol)
                         self._collect_current_price(symbol)
+                        self._manage_position(symbol)
                     except Exception:
                         logger.exception("warmup error for %s", symbol)
 
-                # 09:10 이후에도 아직 PREMARKET_WAIT이면 자동으로 ACTIVE 전환
-                # (장전 스캔이 실패한 경우 안전망)
-                if now.hour >= 9 and now.minute >= 10:
+                # 장전 스캔 실패 시 임의 종목으로 신규 주문을 활성화하지 않는다.
+                if now.time() >= dt_time(9, 10):
                     logger.warning(
-                        "PREMARKET_WAIT 09:10 초과 — 현재 종목으로 자동 ACTIVE 전환: %s",
+                        "PREMARKET_WAIT 09:10 초과 — 신규 진입 차단 유지, 기존 주문/포지션만 관리: %s",
                         symbols,
                     )
                     with self._lock:
-                        self._premarket_ready = True
+                        self._last_error = "premarket scan not completed; new entries blocked"
 
                 # signal_log 주기적 정리
                 if self._loop_count % 1000 == 0:
@@ -591,7 +596,7 @@ class ICTTradingEngine:
         self._submit_entry(setup.trade_plan, quantity, setup_id=setup_id)
 
     def _build_setup_from_1m(self, symbol: str, bars_1m: list[Candle]):
-        bars_1d = MinuteBarCache.resample(bars_1m, 390, "1d")
+        bars_1d = MinuteBarCache.resample_krx_session_daily(bars_1m)
         return self.builder.build_long_setup(symbol, bars_1m, bars_1d)
 
     def _submit_entry(self, plan: TradePlan, quantity: int, setup_id: str = "") -> None:
@@ -688,12 +693,13 @@ class ICTTradingEngine:
             position.status = TradeState.CLOSED
             # Use FillReconciler for actual exit fill
             fill_result = self.fill_reconciler.reconcile(
-                order_no=position.exit_order_no or position.order_no,
+                order_no=position.exit_order_no or position.tp2_order_no or position.tp_order_no or position.order_no,
                 symbol=position.symbol,
                 side="sell",
                 quantity=position.quantity,
                 entry_price=position.entry,
                 env_dv="vps",
+                stop_price=position.stop,
             )
             if fill_result.is_complete:
                 net_pnl = self._calc_net_pnl(fill_result.realized_pnl, fill_result.avg_price or position.entry, position.quantity)

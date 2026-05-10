@@ -239,7 +239,13 @@ class RiskReviewAgent:
 
         try:
             prompt = self.build_review_prompt(checklist, signal_detail)
-            result, usage = self.llm.complete_json(SYSTEM_PROMPT, prompt, max_tokens=1500)
+            result, usage = self.llm.complete_json(
+                SYSTEM_PROMPT,
+                prompt,
+                max_tokens=1500,
+                required_keys=["conclusion", "key_risk_factors", "strengths", "market_context", "telegram_summary"],
+                fallback=self._fallback_review(checklist),
+            )
             logger.debug("RiskReviewAgent LLM 완료 — 토큰: %s", usage)
             return result
         except Exception:

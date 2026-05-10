@@ -49,11 +49,19 @@ class SupabaseClient:
             "Prefer": "return=representation",
         }
 
-    def select(self, table: str, filters: dict | None = None, limit: int = 1000) -> list[dict]:
+    def select(
+        self,
+        table: str,
+        filters: dict | None = None,
+        limit: int = 1000,
+        order: str | None = None,
+    ) -> list[dict]:
         """SELECT from table with filters."""
         params: dict[str, Any] = {"limit": limit}
         if filters:
             params.update(filters)
+        if order:
+            params["order"] = order
         try:
             resp = requests.get(
                 f"{self.base}/{table}",
@@ -224,11 +232,13 @@ class DailyReportWorker:
         r_multiples = []
         for f in sell_fills:
             pnl = float(f.get("realized_pnl", 0) or 0)
-            risk = float(f.get("fees", 0) or 0)  # fees를 risk proxy로 사용
-            # 실제로는 risk_amount를 orders 테이블과 조인해야 정확하지만
-            # 단순화를 위해 pnl 부호로만 계산
-            if pnl != 0:
-                r_multiples.append(1.0 if pnl > 0 else -1.0)
+            risk = float(
+                f.get("risk_amount")
+                or (f.get("payload") or {}).get("risk_amount")
+                or 0
+            )
+            if risk > 0:
+                r_multiples.append(pnl / risk)
         avg_r = sum(r_multiples) / len(r_multiples) if r_multiples else 0.0
 
         return {
@@ -267,7 +277,7 @@ class DailyReportWorker:
         except Exception:
             logger.exception("save_report error")
 
-    def run_once(self) -> dict[str, Any]:
+    def run_once(self, run_agents: bool = True) -> dict[str, Any]:
         """한 번 실행 후 결과 반환."""
         fills = self.fetch_today_fills()
         metrics = self.calculate_metrics(fills)
@@ -298,7 +308,23 @@ class DailyReportWorker:
             except Exception:
                 logger.exception("Telegram send_daily_summary error")
 
+        if run_agents:
+            self._run_postmarket_agents(today)
+
         return metrics
+
+    def _run_postmarket_agents(self, trade_date: str) -> None:
+        """Run non-ordering postmarket agents synchronously for scheduler observability."""
+        try:
+            from agents.daily_report_agent import DailyReportAgent
+            DailyReportAgent().run(trade_date=trade_date)
+        except Exception as e:
+            logger.warning("DailyReportAgent 실패: %s", e)
+        try:
+            from agents.audit_agent import AuditAgent
+            AuditAgent().run(trade_date=trade_date)
+        except Exception as e:
+            logger.warning("AuditAgent 실패: %s", e)
 
     def run_scheduled(self) -> None:
         """15:40 이후 한 번 실행하고 다음날 대기하는 메인 루프."""
@@ -325,7 +351,7 @@ class DailyReportWorker:
                     # 오늘 리포트가 아직 생성되지 않았으면 실행
                     if last_execution_date != current_date:
                         logger.info("DailyReportWorker: running at %s", now.strftime("%H:%M:%S"))
-                        metrics = self.run_once()
+                        metrics = self.run_once(run_agents=True)
                         logger.info(
                             "DailyReportWorker completed: pnl=%.0f, trades=%d, win_rate=%.0%%",
                             metrics["total_pnl"],
@@ -334,26 +360,7 @@ class DailyReportWorker:
                         )
                         last_execution_date = current_date
 
-                        # Audit Agent + Daily Report Agent 비동기 실행
-                        import threading
-                        def _run_agents(date_str):
-                            try:
-                                from agents.daily_report_agent import DailyReportAgent
-                                DailyReportAgent().run(trade_date=date_str)
-                            except Exception as e:
-                                logger.warning("DailyReportAgent 실패: %s", e)
-                            try:
-                                from agents.audit_agent import AuditAgent
-                                AuditAgent().run(trade_date=date_str)
-                            except Exception as e:
-                                logger.warning("AuditAgent 실패: %s", e)
-                        threading.Thread(
-                            target=_run_agents,
-                            args=(current_date,),
-                            name="post-market-agents",
-                            daemon=True,
-                        ).start()
-                        logger.info("장후 AI 에이전트 백그라운드 시작 (DailyReport + Audit)")
+                        logger.info("장후 AI 에이전트 완료 (DailyReport + Audit)")
                     else:
                         # 이미 오늘 실행했으면 다음날까지 대기
                         time.sleep(3600)  # 1시간마다 확인

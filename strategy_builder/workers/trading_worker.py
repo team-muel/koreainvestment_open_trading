@@ -5,7 +5,7 @@ Docker 컨테이너에서 trading-worker 프로세스로 실행된다.
 시작 흐름:
   1. 엔진을 PREMARKET_WAIT 모드로 시작 (warmup만 실행, 주문 금지)
   2. 장전 스캔 완료 시 ict_engine.update_symbols() 호출 → ACTIVE 전환
-  3. 09:10 이후에도 스캔 미완료 시 현재 종목으로 자동 ACTIVE 전환 (안전망)
+  3. 장전 스캔 실패 시 신규 주문은 계속 금지하고 기존 주문/포지션만 관리
 """
 from __future__ import annotations
 

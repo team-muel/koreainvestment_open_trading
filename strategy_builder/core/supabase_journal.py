@@ -304,7 +304,7 @@ class SupabaseJournal:
         if not self._client:
             return
         try:
-            self._client.insert("fills", {
+            self._client.upsert("fills", {
                 "order_no": fill.get("order_no"),
                 "symbol": fill.get("symbol"),
                 "side": fill.get("side", "buy"),
@@ -312,10 +312,11 @@ class SupabaseJournal:
                 "avg_price": fill.get("avg_price"),
                 "fees": fill.get("fees", 0),
                 "realized_pnl": fill.get("realized_pnl"),
+                "risk_amount": fill.get("risk_amount"),
                 "is_complete": fill.get("is_complete", False),
                 "fill_time": fill.get("fill_time") or datetime.now(KST).isoformat(),
                 "payload": fill,
-            })
+            }, on_conflict="order_no,side")
         except Exception:
             logger.exception("SupabaseJournal.save_fill failed")
 
@@ -479,6 +480,31 @@ class SupabaseJournal:
             })
         except Exception:
             logger.exception("SupabaseJournal.record_strategy_change failed")
+
+    def record_agent_tool_call(
+        self,
+        agent_name: str,
+        tool_name: str,
+        input_payload: dict[str, Any],
+        output_payload: dict[str, Any] | None = None,
+        status: str = "SUCCESS",
+        error_message: str = "",
+    ) -> None:
+        """Persist a safe audit trail for internal agent tool calls."""
+        if not self._client:
+            return
+        try:
+            self._client.insert("agent_tool_calls", {
+                "agent_name": agent_name,
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_payload": output_payload or {},
+                "status": status,
+                "error_message": error_message[:500] if error_message else None,
+                "created_at": datetime.now(KST).isoformat(),
+            })
+        except Exception:
+            logger.exception("SupabaseJournal.record_agent_tool_call failed")
 
     # ── job_runs: 워크플로 멱등성 보장 ──────────────────────────
 

@@ -37,6 +37,8 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(root, "deploy", ".env"))
 
 from strategy_builder.agents.llm_client import LLMClient
+from strategy_builder.agents.tool_registry import build_agent_tool_registry
+from strategy_builder.core.supabase_journal import SupabaseJournal
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -73,37 +75,9 @@ class StrategyReviewerAgent:
         self.notion_daily_db = os.environ.get("NOTION_DAILY_REPORT_DB_ID", "").strip()
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        self.tool_registry = build_agent_tool_registry(audit_sink=SupabaseJournal())
 
-    def _sb_get(self, table: str, params: dict | None = None) -> list[dict]:
-        if not self.supabase_url:
-            return []
-        try:
-            resp = requests.get(
-                f"{self.supabase_url}/rest/v1/{table}",
-                headers={"apikey": self.supabase_key, "Authorization": f"Bearer {self.supabase_key}",
-                         "Prefer": "return=representation"},
-                params=params or {}, timeout=15,
-            )
-            return resp.json() if resp.ok else []
-        except Exception:
-            return []
-
-    def _sb_upsert(self, table: str, data: dict, on_conflict: str = "") -> bool:
-        if not self.supabase_url:
-            return False
-        try:
-            params = {}
-            if on_conflict:
-                params["on_conflict"] = on_conflict
-            resp = requests.post(
-                f"{self.supabase_url}/rest/v1/{table}",
-                headers={"apikey": self.supabase_key, "Authorization": f"Bearer {self.supabase_key}",
-                         "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
-                json=[data], params=params, timeout=15,
-            )
-            return resp.ok
-        except Exception:
-            return False
+    # Supabase access for this agent goes through AgentToolRegistry.
 
     # ── 데이터 수집 ───────────────────────────────────────────
 
@@ -111,46 +85,11 @@ class StrategyReviewerAgent:
         """최근 N주 거래 데이터 수집."""
         start_date = (datetime.now(KST) - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
         logger.info("전략 리뷰 데이터 수집: %s 이후 %d주", start_date, weeks)
-
-        # 일일 리포트
-        daily_reports = self._sb_get("daily_reports", {
-            "report_date": f"gte.{start_date}",
-            "order": "report_date.asc",
-            "limit": "30",
-        })
-
-        # 시그널 (진입 성공/차단 모두)
-        signals = self._sb_get("signals", {
-            "created_at": f"gte.{start_date}T00:00:00+09:00",
-            "order": "created_at.asc",
-            "limit": "200",
-        })
-
-        # 실체결
-        fills = self._sb_get("fills", {
-            "fill_time": f"gte.{start_date}T00:00:00+09:00",
-            "is_complete": "eq.true",
-            "order": "fill_time.asc",
-            "limit": "100",
-        })
-
-        # agent_runs (리스크 리뷰 포함)
-        risk_reviews = self._sb_get("agent_runs", {
-            "agent_name": "eq.risk_review_agent",
-            "trade_date": f"gte.{start_date}",
-            "order": "trade_date.asc",
-            "limit": "50",
-        })
-
-        return {
-            "period_weeks": weeks,
-            "start_date": start_date,
-            "end_date": datetime.now(KST).strftime("%Y-%m-%d"),
-            "daily_reports": daily_reports,
-            "signals": signals,
-            "fills": fills,
-            "risk_reviews": risk_reviews,
-        }
+        return self.tool_registry.call(
+            "strategy_reviewer_agent",
+            "get_strategy_review_context",
+            weeks=weeks,
+        )
 
     # ── 통계 계산 ─────────────────────────────────────────────
 
@@ -310,7 +249,13 @@ class StrategyReviewerAgent:
 
         try:
             prompt = self.build_review_prompt(data, stats)
-            result, usage = self.llm.complete_json(SYSTEM_PROMPT, prompt, max_tokens=3000)
+            result, usage = self.llm.complete_json(
+                SYSTEM_PROMPT,
+                prompt,
+                max_tokens=3000,
+                required_keys=["performance_summary", "parameter_suggestions", "telegram_summary"],
+                fallback=self._fallback_review(stats),
+            )
             logger.info("StrategyReviewerAgent LLM 완료 — 토큰: %s", usage)
             return result
         except Exception:
@@ -455,19 +400,21 @@ class StrategyReviewerAgent:
         self.send_telegram(review)
 
         # 6. agent_runs 기록
-        self._sb_upsert("agent_runs", {
-            "agent_name": "strategy_reviewer_agent",
-            "trade_date": datetime.now(KST).date().isoformat(),
-            "input_payload": {"weeks": weeks, "trading_days": stats["trading_days"]},
-            "output_payload": {
+        self.tool_registry.call(
+            "strategy_reviewer_agent",
+            "save_agent_run",
+            agent_name="strategy_reviewer_agent",
+            trade_date=datetime.now(KST).date().isoformat(),
+            input_payload={"weeks": weeks, "trading_days": stats["trading_days"]},
+            output_payload={
                 "summary": review.get("performance_summary", "")[:300],
                 "suggestions_count": len(review.get("parameter_suggestions", [])),
                 "win_rate": stats["win_rate"],
                 "profit_factor": stats["profit_factor"],
             },
-            "status": "SUCCESS",
-            "llm_model": self.llm.model,
-        }, on_conflict="agent_name,trade_date")
+            status="SUCCESS",
+            llm_model=self.llm.model,
+        )
 
         logger.info("=== Strategy Reviewer Agent 완료 ===")
         return {

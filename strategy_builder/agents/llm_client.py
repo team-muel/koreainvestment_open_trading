@@ -120,6 +120,8 @@ class LLMClient:
         system: str,
         user: str,
         max_tokens: int = 2000,
+        required_keys: list[str] | None = None,
+        fallback: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, int]]:
         """JSON 출력 강제. (dict, 토큰 사용량) 반환."""
         json_instruction = (
@@ -136,13 +138,37 @@ class LLMClient:
                     if part.startswith("json"):
                         part = part[4:]
                     try:
-                        return json.loads(part.strip()), usage
+                        parsed = json.loads(part.strip())
+                        return self._validate_json_result(parsed, required_keys, fallback), usage
                     except json.JSONDecodeError:
                         continue
-            return json.loads(cleaned), usage
+            parsed = json.loads(cleaned)
+            return self._validate_json_result(parsed, required_keys, fallback), usage
         except json.JSONDecodeError:
             logger.warning("LLM JSON 파싱 실패: %s...", text[:200])
-            return {"error": "json_parse_failed", "raw": text[:500]}, usage
+            return fallback or {"error": "json_parse_failed", "raw": text[:500]}, usage
+
+    @staticmethod
+    def _validate_json_result(
+        parsed: Any,
+        required_keys: list[str] | None,
+        fallback: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(parsed, dict):
+            if fallback is not None:
+                return fallback
+            return {"error": "json_not_object", "raw_type": type(parsed).__name__}
+        if required_keys:
+            missing = [key for key in required_keys if key not in parsed]
+            if missing:
+                logger.warning("LLM JSON 필수 필드 누락: %s", missing)
+                if fallback is not None:
+                    merged = dict(fallback)
+                    merged.update({k: v for k, v in parsed.items() if k in required_keys or k not in merged})
+                    merged["llm_validation_warning"] = f"missing keys: {', '.join(missing)}"
+                    return merged
+                parsed["llm_validation_warning"] = f"missing keys: {', '.join(missing)}"
+        return parsed
 
     # ── Google Gemini ──────────────────────────────────────────
 

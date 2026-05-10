@@ -6,7 +6,7 @@ import logging
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Iterable
 from zoneinfo import ZoneInfo
@@ -235,6 +235,43 @@ class MinuteBarCache:
             ))
         return result
 
+    @staticmethod
+    def resample_krx_session_daily(bars: list[Candle]) -> list[Candle]:
+        """Build KRX regular-session daily candles from 1-minute bars.
+
+        Generic 390-minute bucketing depends on the first timestamp of a day and
+        can split a 09:00-15:30 Korean session into the wrong daily candle. The
+        ICT intraday strategy uses previous-day high/low as a core liquidity
+        level, so daily candles must be grouped by actual KRX session date.
+        """
+        if not bars:
+            return []
+        session_open = time(9, 0)
+        session_close = time(15, 30)
+        buckets: dict[object, list[Candle]] = {}
+        for bar in bars:
+            ts = bar.timestamp
+            if ts.tzinfo is not None:
+                ts = ts.astimezone(KST).replace(tzinfo=None)
+            if not (session_open <= ts.time() <= session_close):
+                continue
+            buckets.setdefault(ts.date(), []).append(bar)
+
+        result: list[Candle] = []
+        for trade_date in sorted(buckets):
+            items = sorted(buckets[trade_date], key=lambda b: b.timestamp)
+            result.append(Candle(
+                timestamp=datetime.combine(trade_date, session_close),
+                open=items[0].open,
+                high=max(i.high for i in items),
+                low=min(i.low for i in items),
+                close=items[-1].close,
+                volume=sum(i.volume for i in items),
+                symbol=items[-1].symbol,
+                timeframe="1d",
+            ))
+        return result
+
 
 class SupabaseMinuteBarCache:
     """Supabase-backed minute bar cache with the same public API as MinuteBarCache."""
@@ -368,6 +405,10 @@ class SupabaseMinuteBarCache:
     @staticmethod
     def resample(bars: list[Candle], interval_minutes: int, timeframe: str) -> list[Candle]:
         return MinuteBarCache.resample(bars, interval_minutes, timeframe)
+
+    @staticmethod
+    def resample_krx_session_daily(bars: list[Candle]) -> list[Candle]:
+        return MinuteBarCache.resample_krx_session_daily(bars)
 
     def _coverage_rows(self, symbol: str) -> list[dict]:
         return self._client.select(
